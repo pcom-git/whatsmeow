@@ -231,7 +231,7 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 	}
 
 	isBotMode := isInlineBotMode || to.IsBot()
-	needsMessageSecret := isBotMode || cli.shouldIncludeReportingToken(message)
+	needsMessageSecret := isBotMode || cli.shouldIncludeReportingToken(message) || messageNeedsSecretForCaptionEdit(message)
 	var extraParams nodeExtraParams
 
 	if needsMessageSecret {
@@ -364,6 +364,13 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 	}
 
 	resp.Sender = ownID
+
+	if !req.Peer && to.Server != types.NewsletterServer {
+		message, err = cli.maybeEncryptMessageEdit(ctx, ownID, to, message)
+		if err != nil {
+			return
+		}
+	}
 
 	start := time.Now()
 	// Sending multiple messages at a time can cause weird issues and makes it harder to retry safely
@@ -607,6 +614,203 @@ func (cli *Client) BuildEdit(chat types.JID, id types.MessageID, newContent *waE
 			},
 		},
 	}
+}
+
+func (cli *Client) maybeEncryptMessageEdit(ctx context.Context, ownID, chat types.JID, message *waE2E.Message) (*waE2E.Message, error) {
+	if message.GetSecretEncryptedMessage().GetSecretEncType() == waE2E.SecretEncryptedMessage_MESSAGE_EDIT {
+		return message, nil
+	}
+	protoMsg := getMessageEditProtocolMessage(message)
+	if protoMsg == nil || protoMsg.GetEditedMessage() == nil {
+		return message, nil
+	}
+	targetKey := protoMsg.GetKey()
+	if targetKey.GetID() == "" {
+		return nil, fmt.Errorf("message edit is missing target message ID")
+	}
+	if text, contextInfo, ok := getTextEditContent(protoMsg.GetEditedMessage()); ok {
+		if mediaEdit, converted := cli.buildCaptionEditFromOriginal(ctx, chat, targetKey.GetID(), text, contextInfo); converted {
+			protoMsg = proto.Clone(protoMsg).(*waE2E.ProtocolMessage)
+			protoMsg.EditedMessage = mediaEdit
+		}
+	}
+	if isTextEditContent(protoMsg.GetEditedMessage()) {
+		return message, nil
+	}
+	plaintext, err := proto.Marshal(&waE2E.Message{
+		ProtocolMessage: protoMsg,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal message edit protobuf: %w", err)
+	}
+	origSender, err := outgoingEditOriginalSender(ownID, chat, targetKey)
+	if err != nil {
+		return nil, err
+	}
+	ciphertext, iv, err := cli.encryptMsgSecret(ctx, ownID, chat, origSender, targetKey.GetID(), EncSecretMessageEdit, plaintext)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encrypt message edit: %w", err)
+	}
+	messageContextInfo := message.GetMessageContextInfo()
+	if messageContextInfo == nil {
+		messageContextInfo = &waE2E.MessageContextInfo{}
+	}
+	if messageContextInfo.MessageSecret == nil {
+		messageContextInfo.MessageSecret = random.Bytes(32)
+	}
+	return &waE2E.Message{
+		SecretEncryptedMessage: &waE2E.SecretEncryptedMessage{
+			TargetMessageKey: proto.Clone(targetKey).(*waCommon.MessageKey),
+			EncPayload:       ciphertext,
+			EncIV:            iv,
+			SecretEncType:    waE2E.SecretEncryptedMessage_MESSAGE_EDIT.Enum(),
+		},
+		MessageContextInfo: messageContextInfo,
+	}, nil
+}
+
+func getMessageEditProtocolMessage(message *waE2E.Message) *waE2E.ProtocolMessage {
+	if protoMsg := message.GetProtocolMessage(); protoMsg.GetType() == waE2E.ProtocolMessage_MESSAGE_EDIT {
+		return protoMsg
+	}
+	if protoMsg := message.GetEditedMessage().GetMessage().GetProtocolMessage(); protoMsg.GetType() == waE2E.ProtocolMessage_MESSAGE_EDIT {
+		return protoMsg
+	}
+	return nil
+}
+
+func isTextEditContent(message *waE2E.Message) bool {
+	return message.Conversation != nil || message.ExtendedTextMessage != nil
+}
+
+func getTextEditContent(message *waE2E.Message) (string, *waE2E.ContextInfo, bool) {
+	if message.Conversation != nil {
+		return message.GetConversation(), nil, true
+	}
+	if message.ExtendedTextMessage != nil {
+		return message.GetExtendedTextMessage().GetText(), message.GetExtendedTextMessage().GetContextInfo(), true
+	}
+	return "", nil, false
+}
+
+func (cli *Client) buildCaptionEditFromOriginal(ctx context.Context, chat types.JID, id types.MessageID, caption string, contextInfo *waE2E.ContextInfo) (*waE2E.Message, bool) {
+	original := cli.getOriginalMessageForEdit(ctx, chat, id)
+	if original == nil {
+		return nil, false
+	}
+	return buildCaptionEditForMessage(original, caption, contextInfo)
+}
+
+func (cli *Client) getOriginalMessageForEdit(ctx context.Context, chat types.JID, id types.MessageID) *waE2E.Message {
+	if recent := cli.getRecentMessage(chat, id); recent.wa != nil {
+		return recent.wa
+	}
+	if cli.UseRetryMessageStore && cli.Store != nil && cli.Store.EventBuffer != nil {
+		format, buf, err := cli.Store.EventBuffer.GetOutgoingEvent(ctx, chat, types.EmptyJID, id)
+		if err == nil && len(buf) > 0 {
+			recent, err := parseRecentMessage(format, buf)
+			if err == nil && recent != nil && recent.wa != nil {
+				return recent.wa
+			}
+		}
+	}
+	if cli.GetMessageForRetry != nil {
+		return cli.GetMessageForRetry(types.EmptyJID, chat, id)
+	}
+	return nil
+}
+
+func buildCaptionEditForMessage(message *waE2E.Message, caption string, contextInfo *waE2E.ContextInfo) (*waE2E.Message, bool) {
+	switch {
+	case message.GetDeviceSentMessage().GetMessage() != nil:
+		return buildCaptionEditForMessage(message.GetDeviceSentMessage().GetMessage(), caption, contextInfo)
+	case message.GetEphemeralMessage().GetMessage() != nil:
+		return buildCaptionEditForMessage(message.GetEphemeralMessage().GetMessage(), caption, contextInfo)
+	case message.GetViewOnceMessage().GetMessage() != nil:
+		return buildCaptionEditForMessage(message.GetViewOnceMessage().GetMessage(), caption, contextInfo)
+	case message.GetViewOnceMessageV2().GetMessage() != nil:
+		return buildCaptionEditForMessage(message.GetViewOnceMessageV2().GetMessage(), caption, contextInfo)
+	case message.GetViewOnceMessageV2Extension().GetMessage() != nil:
+		return buildCaptionEditForMessage(message.GetViewOnceMessageV2Extension().GetMessage(), caption, contextInfo)
+	case message.GetDocumentWithCaptionMessage().GetMessage() != nil:
+		return buildCaptionEditForMessage(message.GetDocumentWithCaptionMessage().GetMessage(), caption, contextInfo)
+	case message.ImageMessage != nil:
+		return &waE2E.Message{
+			ImageMessage: &waE2E.ImageMessage{
+				Caption:     proto.String(caption),
+				ContextInfo: cloneContextInfoOrDefault(contextInfo, message.ImageMessage.ContextInfo),
+			},
+		}, true
+	case message.VideoMessage != nil:
+		return &waE2E.Message{
+			VideoMessage: &waE2E.VideoMessage{
+				Caption:     proto.String(caption),
+				ContextInfo: cloneContextInfoOrDefault(contextInfo, message.VideoMessage.ContextInfo),
+			},
+		}, true
+	case message.DocumentMessage != nil:
+		return &waE2E.Message{
+			DocumentMessage: &waE2E.DocumentMessage{
+				Caption:     proto.String(caption),
+				ContextInfo: cloneContextInfoOrDefault(contextInfo, message.DocumentMessage.ContextInfo),
+			},
+		}, true
+	default:
+		return nil, false
+	}
+}
+
+func cloneContextInfoOrDefault(primary, fallback *waE2E.ContextInfo) *waE2E.ContextInfo {
+	if primary != nil {
+		return proto.Clone(primary).(*waE2E.ContextInfo)
+	}
+	if fallback != nil {
+		return proto.Clone(fallback).(*waE2E.ContextInfo)
+	}
+	return nil
+}
+
+func messageNeedsSecretForCaptionEdit(message *waE2E.Message) bool {
+	switch {
+	case message.GetDeviceSentMessage().GetMessage() != nil:
+		return messageNeedsSecretForCaptionEdit(message.GetDeviceSentMessage().GetMessage())
+	case message.GetEphemeralMessage().GetMessage() != nil:
+		return messageNeedsSecretForCaptionEdit(message.GetEphemeralMessage().GetMessage())
+	case message.GetViewOnceMessage().GetMessage() != nil:
+		return messageNeedsSecretForCaptionEdit(message.GetViewOnceMessage().GetMessage())
+	case message.GetViewOnceMessageV2().GetMessage() != nil:
+		return messageNeedsSecretForCaptionEdit(message.GetViewOnceMessageV2().GetMessage())
+	case message.GetViewOnceMessageV2Extension().GetMessage() != nil:
+		return messageNeedsSecretForCaptionEdit(message.GetViewOnceMessageV2Extension().GetMessage())
+	case message.GetDocumentWithCaptionMessage().GetMessage() != nil:
+		return messageNeedsSecretForCaptionEdit(message.GetDocumentWithCaptionMessage().GetMessage())
+	default:
+		return message.ImageMessage != nil || message.VideoMessage != nil || message.DocumentMessage != nil
+	}
+}
+
+func outgoingEditOriginalSender(ownID, chat types.JID, key *waCommon.MessageKey) (types.JID, error) {
+	if key.GetFromMe() {
+		return ownID, nil
+	}
+	if key.GetParticipant() != "" {
+		participant, err := types.ParseJID(key.GetParticipant())
+		if err != nil {
+			return types.EmptyJID, fmt.Errorf("failed to parse message edit participant %q: %w", key.GetParticipant(), err)
+		}
+		return participant, nil
+	}
+	if chat.Server == types.DefaultUserServer || chat.Server == types.HiddenUserServer {
+		if key.GetRemoteJID() == "" {
+			return chat, nil
+		}
+		remote, err := types.ParseJID(key.GetRemoteJID())
+		if err != nil {
+			return types.EmptyJID, fmt.Errorf("failed to parse message edit remote JID %q: %w", key.GetRemoteJID(), err)
+		}
+		return remote, nil
+	}
+	return ownID, nil
 }
 
 const (
@@ -1042,6 +1246,8 @@ func getEditAttribute(msg *waE2E.Message) types.EditAttribute {
 				return types.EditAttributeMessageEdit
 			}
 		}
+	case msg.SecretEncryptedMessage != nil && msg.SecretEncryptedMessage.GetSecretEncType() == waE2E.SecretEncryptedMessage_MESSAGE_EDIT:
+		return types.EditAttributeMessageEdit
 	case msg.ReactionMessage != nil && msg.ReactionMessage.GetText() == RemoveReactionText:
 		return types.EditAttributeSenderRevoke
 	case msg.KeepInChatMessage != nil && msg.KeepInChatMessage.GetKey().GetFromMe() && msg.KeepInChatMessage.GetKeepType() == waE2E.KeepType_UNDO_KEEP_FOR_ALL:

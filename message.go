@@ -428,7 +428,34 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 				continue
 			}
 			protobufFailed = false
-			handlerFailed = cli.handleDecryptedMessage(ctx, info, &msg, retryCount)
+			msgToHandle := &msg
+			if decryptedMsg, wasSecretEncrypted, decryptErr := cli.maybeDecryptSecretEncryptedMessage(ctx, info, &msg); wasSecretEncrypted {
+				err = decryptErr
+				if err != nil {
+					cli.Log.Warnf("Error decrypting secret encrypted message %s from %s: %v", info.ID, info.SourceString(), err)
+					if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+						return
+					}
+					if encType == "msmsg" || errors.Is(err, ErrOriginalMessageSecretNotFound) {
+						cli.backgroundIfAsyncAck(func() {
+							cli.sendAck(ctx, node, NackMissingMessageSecret)
+						})
+					} else if cli.SynchronousAck {
+						cli.sendRetryReceipt(ctx, node, info, false)
+						cli.sendAck(ctx, node, 0)
+					} else {
+						go cli.sendRetryReceipt(context.WithoutCancel(ctx), node, info, false)
+						go cli.sendAck(ctx, node, 0)
+					}
+					cli.dispatchEvent(&events.UndecryptableMessage{
+						Info:            *info,
+						DecryptFailMode: events.DecryptFailMode(ag.OptionalString("decrypt-fail")),
+					})
+					return
+				}
+				msgToHandle = decryptedMsg
+			}
+			handlerFailed = cli.handleDecryptedMessage(ctx, info, msgToHandle, retryCount)
 		case 3:
 			handlerFailed, protobufFailed = cli.handleDecryptedArmadillo(ctx, info, decrypted, retryCount)
 		default:
