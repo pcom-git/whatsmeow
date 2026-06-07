@@ -510,6 +510,11 @@ func (cli *Client) SendAppState(ctx context.Context, patch appstate.PatchInfo) e
 	return cli.sendAppState(ctx, patch, true)
 }
 
+// SetChatNote updates the current user's note for the given chat.
+func (cli *Client) SetChatNote(ctx context.Context, target types.JID, note string) error {
+	return cli.sendChatNoteAppState(ctx, appstate.BuildNoteEdit(target, note), true)
+}
+
 func (cli *Client) sendAppState(ctx context.Context, patch appstate.PatchInfo, allowRetry bool) error {
 	if cli == nil {
 		return ErrClientIsNil
@@ -585,6 +590,99 @@ func (cli *Client) sendAppState(ctx context.Context, patch appstate.PatchInfo, a
 					}
 				}()
 				return cli.sendAppState(ctx, patch, false)
+			}
+		}
+		return mainErr
+	}
+	eventsToDispatch, err := cli.fetchAppState(ctx, patch.Type, false, false)
+	if err != nil {
+		return fmt.Errorf("failed to fetch app state after sending update: %w", err)
+	}
+	go func() {
+		for _, evt := range eventsToDispatch {
+			cli.dispatchEvent(evt)
+		}
+	}()
+
+	return nil
+}
+
+func (cli *Client) sendChatNoteAppState(ctx context.Context, patch appstate.PatchInfo, allowRetry bool) error {
+	if cli == nil {
+		return ErrClientIsNil
+	}
+	version, hash, err := cli.Store.AppState.GetAppStateVersion(ctx, string(patch.Type))
+	if err != nil {
+		return err
+	}
+	// TODO create new key instead of reusing the primary client's keys
+	latestKeyID, err := cli.Store.AppStateKeys.GetLatestAppStateSyncKeyID(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get latest app state key ID: %w", err)
+	} else if latestKeyID == nil {
+		return fmt.Errorf("no app state keys found, creating app state keys is not yet supported")
+	}
+
+	state := appstate.HashState{Version: version, Hash: hash}
+
+	encodedPatch, err := cli.appStateProc.EncodePatch(ctx, latestKeyID, state, patch)
+	if err != nil {
+		return err
+	}
+
+	resp, err := cli.sendIQ(ctx, infoQuery{
+		Namespace: "w:sync:app:state",
+		Type:      iqSet,
+		To:        types.ServerJID,
+		Content: []waBinary.Node{{
+			Tag:   "sync",
+			Attrs: waBinary.Attrs{"data_namespace": "3"},
+			Content: []waBinary.Node{{
+				Tag: "collection",
+				Attrs: waBinary.Attrs{
+					"name":    string(patch.Type),
+					"order":   "1",
+					"version": version,
+				},
+				Content: []waBinary.Node{{
+					Tag:     "patch",
+					Content: encodedPatch,
+				}},
+			}},
+		}},
+	})
+	if err != nil {
+		return err
+	}
+
+	respCollection, ok := resp.GetOptionalChildByTag("sync", "collection")
+	if !ok {
+		return &ElementMissingError{Tag: "collection", In: "app state send response"}
+	}
+	respCollectionAttr := respCollection.AttrGetter()
+	if respCollectionAttr.OptionalString("type") == "error" {
+		errorTag, ok := respCollection.GetOptionalChildByTag("error")
+
+		mainErr := fmt.Errorf("%w: %s", ErrAppStateUpdate, respCollection.XMLString())
+		if ok {
+			mainErr = fmt.Errorf("%w (%s): %s", ErrAppStateUpdate, patch.Type, errorTag.XMLString())
+		}
+		if ok && errorTag.AttrGetter().Int("code") == 409 && allowRetry {
+			zerolog.Ctx(ctx).Warn().Err(mainErr).Msg("Failed to update app state, trying to apply conflicts and retry")
+			var eventsToDispatch []any
+			patches, err := appstate.ParsePatchList(ctx, &respCollection, cli.downloadExternalAppStateBlob)
+			if err != nil {
+				return fmt.Errorf("%w (also, parsing patches in the response failed: %w)", mainErr, err)
+			} else if state, err = cli.applyAppStatePatches(ctx, patch.Type, state, patches, false, &eventsToDispatch); err != nil {
+				return fmt.Errorf("%w (also, applying patches in the response failed: %w)", mainErr, err)
+			} else {
+				zerolog.Ctx(ctx).Debug().Msg("Retrying app state send after applying conflicting patches")
+				go func() {
+					for _, evt := range eventsToDispatch {
+						cli.dispatchEvent(evt)
+					}
+				}()
+				return cli.sendChatNoteAppState(ctx, patch, false)
 			}
 		}
 		return mainErr

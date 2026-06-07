@@ -140,6 +140,27 @@ func BuildMarkChatAsRead(target types.JID, read bool, lastMessageTimestamp time.
 	}
 }
 
+// BuildNoteEdit builds an app state patch for editing a chat note.
+func BuildNoteEdit(target types.JID, note string) PatchInfo {
+	noteType := waSyncAction.NoteEditAction_UNSTRUCTURED
+	return PatchInfo{
+		Type: WAPatchRegularLow,
+		Mutations: []MutationInfo{{
+			Index:   []string{IndexNoteEdit, target.String()},
+			Version: 5,
+			Value: &waSyncAction.SyncActionValue{
+				NoteEditAction: &waSyncAction.NoteEditAction{
+					Type:                noteType.Enum(),
+					ChatJID:             proto.String(target.String()),
+					CreatedAt:           proto.Int64(time.Now().UnixMilli()),
+					Deleted:             proto.Bool(false),
+					UnstructuredContent: proto.String(note),
+				},
+			},
+		}},
+	}
+}
+
 func newLabelChatMutation(target types.JID, labelID string, labeled bool) MutationInfo {
 	return MutationInfo{
 		Index:   []string{IndexLabelAssociationChat, labelID, target.String()},
