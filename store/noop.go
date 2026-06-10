@@ -193,6 +193,22 @@ func (n *NoopStore) GetAllContacts(ctx context.Context) (map[types.JID]types.Con
 	return nil, n.Error
 }
 
+func (n *NoopStore) GetContactListPage(ctx context.Context, options ContactListPageOptions) (ContactListPage, error) {
+	if options.Page <= 0 {
+		options.Page = 1
+	}
+	if options.PageSize <= 0 {
+		options.PageSize = 50
+	} else if options.PageSize > 500 {
+		options.PageSize = 500
+	}
+	return ContactListPage{
+		List:     []ContactListPageEntry{},
+		Page:     options.Page,
+		PageSize: options.PageSize,
+	}, nil
+}
+
 func (n *NoopStore) PutMutedUntil(ctx context.Context, chat types.JID, mutedUntil time.Time) error {
 	return n.Error
 }

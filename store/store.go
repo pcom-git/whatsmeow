@@ -99,6 +99,26 @@ func (rpe RedactedPhoneEntry) GetMassInsertValues() [2]any {
 	return [...]any{rpe.JID.String(), rpe.RedactedPhone}
 }
 
+type ContactListPageOptions struct {
+	Page     int
+	PageSize int
+}
+
+type ContactListPageEntry struct {
+	JID  types.JID
+	LID  types.JID
+	Info types.ContactInfo
+}
+
+type ContactListPage struct {
+	List       []ContactListPageEntry
+	Page       int
+	PageSize   int
+	Total      int
+	TotalPages int
+	HasMore    bool
+}
+
 type ContactStore interface {
 	PutPushName(ctx context.Context, user types.JID, pushName string) (bool, string, error)
 	PutBusinessName(ctx context.Context, user types.JID, businessName string) (bool, string, error)
@@ -107,6 +127,7 @@ type ContactStore interface {
 	PutManyRedactedPhones(ctx context.Context, entries []RedactedPhoneEntry) error
 	GetContact(ctx context.Context, user types.JID) (types.ContactInfo, error)
 	GetAllContacts(ctx context.Context) (map[types.JID]types.ContactInfo, error)
+	GetContactListPage(ctx context.Context, options ContactListPageOptions) (ContactListPage, error)
 }
 
 var MutedForever = time.Date(9999, 12, 31, 23, 59, 59, 999999999, time.UTC)
