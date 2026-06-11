@@ -33,6 +33,7 @@ var NoopDevice = &Device{
 	AppStateKeys:  nilStore,
 	AppState:      nilStore,
 	Contacts:      nilStore,
+	Groups:        nilStore,
 	ChatSettings:  nilStore,
 	MsgSecrets:    nilStore,
 	PrivacyTokens: nilStore,
@@ -204,6 +205,54 @@ func (n *NoopStore) GetContactListPage(ctx context.Context, options ContactListP
 	}
 	return ContactListPage{
 		List:     []ContactListPageEntry{},
+		Page:     options.Page,
+		PageSize: options.PageSize,
+	}, nil
+}
+
+func (n *NoopStore) PutJoinedGroupsSnapshot(ctx context.Context, groups []*types.GroupInfo, syncedAt time.Time) error {
+	return n.Error
+}
+
+func (n *NoopStore) PutGroupInfoSnapshot(ctx context.Context, group *types.GroupInfo, syncedAt time.Time) error {
+	return n.Error
+}
+
+func (n *NoopStore) PutGroupInfoEvent(ctx context.Context, evt *GroupInfoEvent) error {
+	return n.Error
+}
+
+func (n *NoopStore) GetGroupListPage(ctx context.Context, options GroupListPageOptions) (GroupListPage, error) {
+	if options.Page <= 0 {
+		options.Page = 1
+	}
+	if options.PageSize <= 0 {
+		options.PageSize = 50
+	} else if options.PageSize > 500 {
+		options.PageSize = 500
+	}
+	return GroupListPage{
+		List:     []GroupListPageEntry{},
+		Page:     options.Page,
+		PageSize: options.PageSize,
+	}, nil
+}
+
+func (n *NoopStore) GetGroup(ctx context.Context, groupJID types.JID) (*GroupListPageEntry, error) {
+	return nil, nil
+}
+
+func (n *NoopStore) GetGroupMemberListPage(ctx context.Context, options GroupMemberListPageOptions) (GroupMemberListPage, error) {
+	if options.Page <= 0 {
+		options.Page = 1
+	}
+	if options.PageSize <= 0 {
+		options.PageSize = 50
+	} else if options.PageSize > 500 {
+		options.PageSize = 500
+	}
+	return GroupMemberListPage{
+		List:     []GroupMemberListPageEntry{},
 		Page:     options.Page,
 		PageSize: options.PageSize,
 	}, nil

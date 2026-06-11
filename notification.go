@@ -477,6 +477,17 @@ func (cli *Client) handleNotification(ctx context.Context, node *waBinary.Node) 
 			if err != nil {
 				cli.Log.Warnf("Failed to store redacted phones from group notification: %v", err)
 			}
+			if cli.Store.Groups != nil {
+				switch groupEvt := evt.(type) {
+				case *events.JoinedGroup:
+					err = cli.Store.Groups.PutGroupInfoSnapshot(ctx, &groupEvt.GroupInfo, time.Now())
+				case *events.GroupInfo:
+					err = cli.Store.Groups.PutGroupInfoEvent(ctx, groupInfoEventToStore(groupEvt))
+				}
+				if err != nil {
+					cli.Log.Warnf("Failed to store group notification data: %v", err)
+				}
+			}
 			cancelled = cli.dispatchEvent(evt)
 		}
 	case "picture":

@@ -130,6 +130,102 @@ type ContactStore interface {
 	GetContactListPage(ctx context.Context, options ContactListPageOptions) (ContactListPage, error)
 }
 
+type GroupListPageOptions struct {
+	Page        int
+	PageSize    int
+	Keyword     string
+	IncludeLeft bool
+}
+
+type GroupListPageEntry struct {
+	GroupID                       string
+	OwnerJID                      string
+	Name                          string
+	Topic                         string
+	IsLocked                      bool
+	IsAnnounce                    bool
+	IsEphemeral                   bool
+	DisappearingTimer             uint32
+	IsIncognito                   bool
+	IsParent                      bool
+	DefaultMembershipApprovalMode string
+	LinkedParentID                string
+	IsDefaultSubGroup             bool
+	IsJoinApprovalRequired        bool
+	ParticipantCount              int
+	MemberAddMode                 types.GroupMemberAddMode
+	Suspended                     bool
+}
+
+type GroupListPage struct {
+	List       []GroupListPageEntry
+	Page       int
+	PageSize   int
+	Total      int
+	TotalPages int
+	HasMore    bool
+}
+
+type GroupMemberListPageOptions struct {
+	GroupJID types.JID
+	Page     int
+	PageSize int
+	Status   string
+	Role     string
+	Keyword  string
+}
+
+type GroupMemberListPageEntry struct {
+	JID          string
+	PhoneNumber  string
+	LID          string
+	DisplayName  string
+	IsAdmin      bool
+	IsSuperAdmin bool
+	Status       string
+}
+
+type GroupMemberListPage struct {
+	List       []GroupMemberListPageEntry
+	Page       int
+	PageSize   int
+	Total      int
+	TotalPages int
+	HasMore    bool
+}
+
+type GroupInfoEvent struct {
+	JID       types.JID
+	Sender    *types.JID
+	SenderPN  *types.JID
+	Timestamp time.Time
+
+	Name                   *types.GroupName
+	Topic                  *types.GroupTopic
+	Locked                 *types.GroupLocked
+	Announce               *types.GroupAnnounce
+	Ephemeral              *types.GroupEphemeral
+	MembershipApprovalMode *types.GroupMembershipApprovalMode
+	Delete                 *types.GroupDelete
+
+	ParticipantVersionID string
+	Join                 []types.JID
+	Leave                []types.JID
+	Promote              []types.JID
+	Demote               []types.JID
+	Suspended            bool
+	Unsuspended          bool
+}
+
+type GroupStore interface {
+	PutJoinedGroupsSnapshot(ctx context.Context, groups []*types.GroupInfo, syncedAt time.Time) error
+	PutGroupInfoSnapshot(ctx context.Context, group *types.GroupInfo, syncedAt time.Time) error
+	PutGroupInfoEvent(ctx context.Context, evt *GroupInfoEvent) error
+	GetGroupListPage(ctx context.Context, options GroupListPageOptions) (GroupListPage, error)
+	GetGroup(ctx context.Context, groupJID types.JID) (*GroupListPageEntry, error)
+	GetGroupMemberListPage(ctx context.Context, options GroupMemberListPageOptions) (GroupMemberListPage, error)
+}
+
 var MutedForever = time.Date(9999, 12, 31, 23, 59, 59, 999999999, time.UTC)
 
 type ChatSettingsStore interface {
@@ -219,6 +315,7 @@ type AllSessionSpecificStores interface {
 	AppStateSyncKeyStore
 	AppStateStore
 	ContactStore
+	GroupStore
 	ChatSettingsStore
 	MsgSecretStore
 	PrivacyTokenStore
@@ -265,6 +362,7 @@ type Device struct {
 	AppStateKeys  AppStateSyncKeyStore
 	AppState      AppStateStore
 	Contacts      ContactStore
+	Groups        GroupStore
 	ChatSettings  ChatSettingsStore
 	MsgSecrets    MsgSecretStore
 	PrivacyTokens PrivacyTokenStore
@@ -324,6 +422,7 @@ func (device *Device) SetAllStores(store AllSessionSpecificStores) {
 	device.AppStateKeys = store
 	device.AppState = store
 	device.Contacts = store
+	device.Groups = store
 	device.ChatSettings = store
 	device.MsgSecrets = store
 	device.PrivacyTokens = store
