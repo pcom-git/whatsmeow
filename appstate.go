@@ -16,6 +16,7 @@ import (
 	"github.com/rs/zerolog"
 	"go.mau.fi/util/exslices"
 	"go.mau.fi/util/ptr"
+	"google.golang.org/protobuf/encoding/protojson"
 
 	"go.mau.fi/whatsmeow/appstate"
 	waBinary "go.mau.fi/whatsmeow/binary"
@@ -383,12 +384,45 @@ func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchNa
 			FromFullSync: fullSync,
 		}
 	case appstate.IndexLabelEdit:
+		if len(mutation.Index) < 2 {
+			return
+		}
 		act := mutation.Action.GetLabelEditAction()
 		eventToDispatch = &events.LabelEdit{
 			Timestamp:    ts,
 			LabelID:      mutation.Index[1],
 			Action:       act,
 			FromFullSync: fullSync,
+		}
+		if cli.Store.Labels != nil {
+			isActive := true
+			if act != nil && act.IsActive != nil {
+				isActive = act.GetIsActive()
+			}
+			var rawAction string
+			if act != nil {
+				rawActionBytes, err := protojson.Marshal(act)
+				if err != nil {
+					cli.Log.Warnf("Failed to marshal label edit action for store: %v", err)
+				} else {
+					rawAction = string(rawActionBytes)
+				}
+			}
+			storeUpdateError = cli.Store.Labels.PutLabel(ctx, store.LabelInfo{
+				LabelID:       mutation.Index[1],
+				Name:          act.GetName(),
+				Type:          int32(act.GetType()),
+				Color:         act.GetColor(),
+				PredefinedID:  act.GetPredefinedID(),
+				Deleted:       act.GetDeleted(),
+				IsActive:      isActive,
+				OrderIndex:    act.GetOrderIndex(),
+				IsImmutable:   act.GetIsImmutable(),
+				MuteEndTimeMS: act.GetMuteEndTimeMS(),
+				LastEventTime: ts,
+				FromFullSync:  fullSync,
+				RawAction:     rawAction,
+			})
 		}
 	case appstate.IndexLabelAssociationChat:
 		if len(mutation.Index) < 3 {
@@ -403,6 +437,27 @@ func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchNa
 			Action:       act,
 			FromFullSync: fullSync,
 		}
+		if cli.Store.Labels != nil {
+			var rawAction string
+			if act != nil {
+				rawActionBytes, err := protojson.Marshal(act)
+				if err != nil {
+					cli.Log.Warnf("Failed to marshal label association action for store: %v", err)
+				} else {
+					rawAction = string(rawActionBytes)
+				}
+			}
+			storeUpdateError = cli.Store.Labels.PutLabelMember(ctx, store.LabelMemberInfo{
+				LabelID:       mutation.Index[1],
+				ChatJID:       jid,
+				ChatType:      store.LabelChatTypeForJID(jid),
+				Labeled:       act.GetLabeled(),
+				Source:        store.LabelSourceAssociation,
+				LastEventTime: ts,
+				FromFullSync:  fullSync,
+				RawAction:     rawAction,
+			})
+		}
 	case appstate.IndexLabelAssociationMessage:
 		if len(mutation.Index) < 6 {
 			return
@@ -416,6 +471,21 @@ func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchNa
 			MessageID:    mutation.Index[3],
 			Action:       act,
 			FromFullSync: fullSync,
+		}
+	case appstate.IndexFavorites:
+		act := mutation.Action.GetFavoritesAction()
+		if cli.Store.Labels != nil {
+			favorites := act.GetFavorites()
+			members := make([]types.JID, 0, len(favorites))
+			for _, favorite := range favorites {
+				jid, err := types.ParseJID(favorite.GetID())
+				if err != nil {
+					cli.Log.Warnf("Failed to parse favorites JID %q for label store: %v", favorite.GetID(), err)
+					continue
+				}
+				members = append(members, jid)
+			}
+			storeUpdateError = cli.Store.Labels.ReplaceFavoriteMembers(ctx, members, ts, fullSync)
 		}
 	}
 	if storeUpdateError != nil {

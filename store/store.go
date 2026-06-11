@@ -194,6 +194,99 @@ type GroupMemberListPage struct {
 	HasMore    bool
 }
 
+const (
+	LabelChatTypeContact = "contact"
+	LabelChatTypeGroup   = "group"
+	LabelChatTypeUnknown = "unknown"
+
+	LabelSourceAssociation = "label_jid"
+	LabelSourceFavorites   = "favorites"
+
+	LabelTypeFavorites int32 = 3
+)
+
+type LabelInfo struct {
+	LabelID       string
+	Name          string
+	Type          int32
+	Color         int32
+	PredefinedID  int32
+	Deleted       bool
+	IsActive      bool
+	OrderIndex    int32
+	IsImmutable   bool
+	MuteEndTimeMS int64
+	IsPending     bool
+	LastEventTime time.Time
+	FromFullSync  bool
+	MemberCount   *int
+	RawAction     string
+}
+
+type LabelMemberInfo struct {
+	LabelID       string
+	ChatJID       types.JID
+	ChatType      string
+	Labeled       bool
+	Source        string
+	LastEventTime time.Time
+	FromFullSync  bool
+	RawAction     string
+}
+
+type LabelListPageOptions struct {
+	Page            int
+	PageSize        int
+	IncludeDeleted  bool
+	IncludeInactive bool
+	Type            *int32
+	IncludeCounts   bool
+}
+
+type LabelListPage struct {
+	List       []LabelInfo
+	Page       int
+	PageSize   int
+	Total      int
+	TotalPages int
+	HasMore    bool
+}
+
+type LabelMemberListPageOptions struct {
+	Page             int
+	PageSize         int
+	ChatType         string
+	IncludeUnlabeled bool
+}
+
+type LabelMemberListPage struct {
+	List       []LabelMemberInfo
+	Page       int
+	PageSize   int
+	Total      int
+	TotalPages int
+	HasMore    bool
+}
+
+type LabelStore interface {
+	PutLabel(ctx context.Context, label LabelInfo) error
+	PutLabelMember(ctx context.Context, member LabelMemberInfo) error
+	ReplaceFavoriteMembers(ctx context.Context, members []types.JID, ts time.Time, fromFullSync bool) error
+	GetLabels(ctx context.Context, options LabelListPageOptions) (LabelListPage, error)
+	GetLabelMembers(ctx context.Context, labelID string, options LabelMemberListPageOptions) (LabelMemberListPage, error)
+}
+
+func LabelChatTypeForJID(jid types.JID) string {
+	switch jid.Server {
+	case types.GroupServer:
+		return LabelChatTypeGroup
+	case types.DefaultUserServer, types.HiddenUserServer:
+		return LabelChatTypeContact
+	default:
+		return LabelChatTypeUnknown
+	}
+}
+
 type GroupInfoEvent struct {
 	JID       types.JID
 	Sender    *types.JID
@@ -316,6 +409,7 @@ type AllSessionSpecificStores interface {
 	AppStateStore
 	ContactStore
 	GroupStore
+	LabelStore
 	ChatSettingsStore
 	MsgSecretStore
 	PrivacyTokenStore
@@ -363,6 +457,7 @@ type Device struct {
 	AppState      AppStateStore
 	Contacts      ContactStore
 	Groups        GroupStore
+	Labels        LabelStore
 	ChatSettings  ChatSettingsStore
 	MsgSecrets    MsgSecretStore
 	PrivacyTokens PrivacyTokenStore
@@ -423,6 +518,7 @@ func (device *Device) SetAllStores(store AllSessionSpecificStores) {
 	device.AppState = store
 	device.Contacts = store
 	device.Groups = store
+	device.Labels = store
 	device.ChatSettings = store
 	device.MsgSecrets = store
 	device.PrivacyTokens = store
