@@ -229,6 +229,38 @@ func BuildLabelEdit(labelID string, labelName string, labelColor int32, deleted 
 	}
 }
 
+// BuildLabelEditFull builds an app state patch for creating or editing a label from a full
+// LabelEditAction value. Unlike BuildLabelEdit, this lets the caller set fields that the simple
+// builder doesn't expose, such as the label type (e.g. CUSTOM), isActive, predefinedID and orderIndex.
+//
+// This is primarily used by the high-level Client.CreateLabel/EditLabel/DeleteLabel helpers.
+func BuildLabelEditFull(labelID string, action *waSyncAction.LabelEditAction) PatchInfo {
+	return PatchInfo{
+		Type: WAPatchRegular,
+		Mutations: []MutationInfo{{
+			Index:   []string{IndexLabelEdit, labelID},
+			Version: 3,
+			Value: &waSyncAction.SyncActionValue{
+				LabelEditAction: action,
+			},
+		}},
+	}
+}
+
+// BuildLabelChatBatch builds a single app state patch that labels or unlabels multiple chats
+// (contacts or groups) with the same label. This lets callers add or remove many members in one
+// request instead of one patch per chat.
+func BuildLabelChatBatch(targets []types.JID, labelID string, labeled bool) PatchInfo {
+	mutations := make([]MutationInfo, 0, len(targets))
+	for _, target := range targets {
+		mutations = append(mutations, newLabelChatMutation(target, labelID, labeled))
+	}
+	return PatchInfo{
+		Type:      WAPatchRegular,
+		Mutations: mutations,
+	}
+}
+
 func newSettingPushNameMutation(pushName string) MutationInfo {
 	return MutationInfo{
 		Index:   []string{IndexSettingPushName},
