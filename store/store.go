@@ -227,6 +227,7 @@ type LabelMemberInfo struct {
 	LabelID       string
 	ChatJID       types.JID
 	ChatType      string
+	DisplayName   string
 	Labeled       bool
 	Source        string
 	LastEventTime time.Time

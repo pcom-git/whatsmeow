@@ -498,14 +498,36 @@ func (s *SQLStore) isQueryableLabel(ctx context.Context, labelID string, allowPe
 
 func buildLabelMemberListWhere(labelID string, options store.LabelMemberListPageOptions) (string, []any) {
 	args := []any{nil, labelID}
-	conditions := []string{"our_jid=$1", "label_id=$2"}
+	conditions := []string{"lm.our_jid=$1", "lm.label_id=$2"}
 	if !options.IncludeUnlabeled {
-		conditions = append(conditions, "labeled=true")
+		conditions = append(conditions, "lm.labeled=true")
 	}
 	if options.ChatType != "" {
-		conditions = append(conditions, "chat_type="+appendSQLArg(&args, options.ChatType))
+		conditions = append(conditions, "lm.chat_type="+appendSQLArg(&args, options.ChatType))
 	}
 	return " WHERE " + strings.Join(conditions, " AND "), args
+}
+
+func displayNameForLabelMember(contact types.ContactInfo, jid types.JID, chatType, groupName string) string {
+	switch chatType {
+	case store.LabelChatTypeContact:
+		switch {
+		case contact.FullName != "":
+			return contact.FullName
+		case contact.FirstName != "":
+			return contact.FirstName
+		case contact.BusinessName != "":
+			return contact.BusinessName
+		case contact.PushName != "":
+			return contact.PushName
+		default:
+			return "+" + jid.User
+		}
+	case store.LabelChatTypeGroup:
+		return groupName
+	default:
+		return ""
+	}
 }
 
 func (s *SQLStore) GetLabelMembers(ctx context.Context, labelID string, options store.LabelMemberListPageOptions) (store.LabelMemberListPage, error) {
@@ -537,7 +559,7 @@ func (s *SQLStore) GetLabelMembers(ctx context.Context, labelID string, options 
 	where, args := buildLabelMemberListWhere(labelID, options)
 	args[0] = s.JID
 
-	countQuery := "SELECT COUNT(*) FROM whatsmeow_label_members" + where
+	countQuery := "SELECT COUNT(*) FROM whatsmeow_label_members lm" + where
 	if err = s.db.QueryRow(ctx, countQuery, args...).Scan(&page.Total); err != nil {
 		return page, err
 	}
@@ -549,10 +571,23 @@ func (s *SQLStore) GetLabelMembers(ctx context.Context, labelID string, options 
 	offset := (options.Page - 1) * options.PageSize
 	listArgs := append(args, options.PageSize, offset)
 	listQuery := `
-		SELECT label_id, chat_jid, chat_type, labeled, source, last_event_time, from_full_sync, raw_action
-		FROM whatsmeow_label_members
+		SELECT
+			lm.label_id, lm.chat_jid, lm.chat_type, lm.labeled, lm.source,
+			lm.last_event_time, lm.from_full_sync, lm.raw_action,
+			COALESCE(c.first_name, ''), COALESCE(c.full_name, ''),
+			COALESCE(c.push_name, ''), COALESCE(c.business_name, ''),
+			COALESCE(g.name, '')
+		FROM whatsmeow_label_members lm
+		LEFT JOIN whatsmeow_contacts c
+		  ON c.our_jid=lm.our_jid
+		 AND c.their_jid=lm.chat_jid
+		 AND lm.chat_type='contact'
+		LEFT JOIN whatsmeow_groups g
+		  ON g.our_jid=lm.our_jid
+		 AND g.group_jid=lm.chat_jid
+		 AND lm.chat_type='group'
 	` + where + `
-		ORDER BY chat_type ASC, chat_jid ASC
+		ORDER BY lm.chat_type ASC, lm.chat_jid ASC
 		LIMIT $` + fmt.Sprint(len(listArgs)-1) + ` OFFSET $` + fmt.Sprint(len(listArgs))
 	rows, err := s.db.Query(ctx, listQuery, listArgs...)
 	if err != nil {
@@ -563,10 +598,27 @@ func (s *SQLStore) GetLabelMembers(ctx context.Context, labelID string, options 
 		var member store.LabelMemberInfo
 		var lastEventMS int64
 		var rawAction sql.NullString
-		err = rows.Scan(&member.LabelID, &member.ChatJID, &member.ChatType, &member.Labeled, &member.Source, &lastEventMS, &member.FromFullSync, &rawAction)
+		var contact types.ContactInfo
+		var groupName string
+		err = rows.Scan(
+			&member.LabelID,
+			&member.ChatJID,
+			&member.ChatType,
+			&member.Labeled,
+			&member.Source,
+			&lastEventMS,
+			&member.FromFullSync,
+			&rawAction,
+			&contact.FirstName,
+			&contact.FullName,
+			&contact.PushName,
+			&contact.BusinessName,
+			&groupName,
+		)
 		if err != nil {
 			return page, fmt.Errorf("error scanning row: %w", err)
 		}
+		member.DisplayName = displayNameForLabelMember(contact, member.ChatJID, member.ChatType, groupName)
 		if lastEventMS > 0 {
 			member.LastEventTime = time.UnixMilli(lastEventMS)
 		}
