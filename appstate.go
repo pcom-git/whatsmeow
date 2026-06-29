@@ -94,7 +94,7 @@ func (cli *Client) fetchAppState(ctx context.Context, name appstate.WAPatchName,
 	}
 	return eventsToDispatch, nil
 }
-
+ 
 func (cli *Client) handleAppStateRecovery(
 	ctx context.Context,
 	reqID types.MessageID,
