@@ -16,6 +16,7 @@ import (
 	"github.com/rs/zerolog"
 	"go.mau.fi/util/exslices"
 	"go.mau.fi/util/ptr"
+	"google.golang.org/protobuf/encoding/protojson"
 
 	"go.mau.fi/whatsmeow/appstate"
 	waBinary "go.mau.fi/whatsmeow/binary"
@@ -383,12 +384,45 @@ func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchNa
 			FromFullSync: fullSync,
 		}
 	case appstate.IndexLabelEdit:
+		if len(mutation.Index) < 2 {
+			return
+		}
 		act := mutation.Action.GetLabelEditAction()
 		eventToDispatch = &events.LabelEdit{
 			Timestamp:    ts,
 			LabelID:      mutation.Index[1],
 			Action:       act,
 			FromFullSync: fullSync,
+		}
+		if cli.Store.Labels != nil {
+			isActive := true
+			if act != nil && act.IsActive != nil {
+				isActive = act.GetIsActive()
+			}
+			var rawAction string
+			if act != nil {
+				rawActionBytes, err := protojson.Marshal(act)
+				if err != nil {
+					cli.Log.Warnf("Failed to marshal label edit action for store: %v", err)
+				} else {
+					rawAction = string(rawActionBytes)
+				}
+			}
+			storeUpdateError = cli.Store.Labels.PutLabel(ctx, store.LabelInfo{
+				LabelID:       mutation.Index[1],
+				Name:          act.GetName(),
+				Type:          int32(act.GetType()),
+				Color:         act.GetColor(),
+				PredefinedID:  act.GetPredefinedID(),
+				Deleted:       act.GetDeleted(),
+				IsActive:      isActive,
+				OrderIndex:    act.GetOrderIndex(),
+				IsImmutable:   act.GetIsImmutable(),
+				MuteEndTimeMS: act.GetMuteEndTimeMS(),
+				LastEventTime: ts,
+				FromFullSync:  fullSync,
+				RawAction:     rawAction,
+			})
 		}
 	case appstate.IndexLabelAssociationChat:
 		if len(mutation.Index) < 3 {
@@ -403,6 +437,27 @@ func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchNa
 			Action:       act,
 			FromFullSync: fullSync,
 		}
+		if cli.Store.Labels != nil {
+			var rawAction string
+			if act != nil {
+				rawActionBytes, err := protojson.Marshal(act)
+				if err != nil {
+					cli.Log.Warnf("Failed to marshal label association action for store: %v", err)
+				} else {
+					rawAction = string(rawActionBytes)
+				}
+			}
+			storeUpdateError = cli.Store.Labels.PutLabelMember(ctx, store.LabelMemberInfo{
+				LabelID:       mutation.Index[1],
+				ChatJID:       jid,
+				ChatType:      store.LabelChatTypeForJID(jid),
+				Labeled:       act.GetLabeled(),
+				Source:        store.LabelSourceAssociation,
+				LastEventTime: ts,
+				FromFullSync:  fullSync,
+				RawAction:     rawAction,
+			})
+		}
 	case appstate.IndexLabelAssociationMessage:
 		if len(mutation.Index) < 6 {
 			return
@@ -416,6 +471,21 @@ func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchNa
 			MessageID:    mutation.Index[3],
 			Action:       act,
 			FromFullSync: fullSync,
+		}
+	case appstate.IndexFavorites:
+		act := mutation.Action.GetFavoritesAction()
+		if cli.Store.Labels != nil {
+			favorites := act.GetFavorites()
+			members := make([]types.JID, 0, len(favorites))
+			for _, favorite := range favorites {
+				jid, err := types.ParseJID(favorite.GetID())
+				if err != nil {
+					cli.Log.Warnf("Failed to parse favorites JID %q for label store: %v", favorite.GetID(), err)
+					continue
+				}
+				members = append(members, jid)
+			}
+			storeUpdateError = cli.Store.Labels.ReplaceFavoriteMembers(ctx, members, ts, fullSync)
 		}
 	}
 	if storeUpdateError != nil {
@@ -510,6 +580,11 @@ func (cli *Client) SendAppState(ctx context.Context, patch appstate.PatchInfo) e
 	return cli.sendAppState(ctx, patch, true)
 }
 
+// SetChatNote updates the current user's note for the given chat.
+func (cli *Client) SetChatNote(ctx context.Context, target types.JID, note string) error {
+	return cli.sendChatNoteAppState(ctx, appstate.BuildNoteEdit(target, note), true)
+}
+
 func (cli *Client) sendAppState(ctx context.Context, patch appstate.PatchInfo, allowRetry bool) error {
 	if cli == nil {
 		return ErrClientIsNil
@@ -585,6 +660,99 @@ func (cli *Client) sendAppState(ctx context.Context, patch appstate.PatchInfo, a
 					}
 				}()
 				return cli.sendAppState(ctx, patch, false)
+			}
+		}
+		return mainErr
+	}
+	eventsToDispatch, err := cli.fetchAppState(ctx, patch.Type, false, false)
+	if err != nil {
+		return fmt.Errorf("failed to fetch app state after sending update: %w", err)
+	}
+	go func() {
+		for _, evt := range eventsToDispatch {
+			cli.dispatchEvent(evt)
+		}
+	}()
+
+	return nil
+}
+
+func (cli *Client) sendChatNoteAppState(ctx context.Context, patch appstate.PatchInfo, allowRetry bool) error {
+	if cli == nil {
+		return ErrClientIsNil
+	}
+	version, hash, err := cli.Store.AppState.GetAppStateVersion(ctx, string(patch.Type))
+	if err != nil {
+		return err
+	}
+	// TODO create new key instead of reusing the primary client's keys
+	latestKeyID, err := cli.Store.AppStateKeys.GetLatestAppStateSyncKeyID(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get latest app state key ID: %w", err)
+	} else if latestKeyID == nil {
+		return fmt.Errorf("no app state keys found, creating app state keys is not yet supported")
+	}
+
+	state := appstate.HashState{Version: version, Hash: hash}
+
+	encodedPatch, err := cli.appStateProc.EncodePatch(ctx, latestKeyID, state, patch)
+	if err != nil {
+		return err
+	}
+
+	resp, err := cli.sendIQ(ctx, infoQuery{
+		Namespace: "w:sync:app:state",
+		Type:      iqSet,
+		To:        types.ServerJID,
+		Content: []waBinary.Node{{
+			Tag:   "sync",
+			Attrs: waBinary.Attrs{"data_namespace": "3"},
+			Content: []waBinary.Node{{
+				Tag: "collection",
+				Attrs: waBinary.Attrs{
+					"name":    string(patch.Type),
+					"order":   "1",
+					"version": version,
+				},
+				Content: []waBinary.Node{{
+					Tag:     "patch",
+					Content: encodedPatch,
+				}},
+			}},
+		}},
+	})
+	if err != nil {
+		return err
+	}
+
+	respCollection, ok := resp.GetOptionalChildByTag("sync", "collection")
+	if !ok {
+		return &ElementMissingError{Tag: "collection", In: "app state send response"}
+	}
+	respCollectionAttr := respCollection.AttrGetter()
+	if respCollectionAttr.OptionalString("type") == "error" {
+		errorTag, ok := respCollection.GetOptionalChildByTag("error")
+
+		mainErr := fmt.Errorf("%w: %s", ErrAppStateUpdate, &respCollection)
+		if ok {
+			mainErr = fmt.Errorf("%w (%s): %s", ErrAppStateUpdate, patch.Type, &errorTag)
+		}
+		if ok && errorTag.AttrGetter().Int("code") == 409 && allowRetry {
+			zerolog.Ctx(ctx).Warn().Err(mainErr).Msg("Failed to update app state, trying to apply conflicts and retry")
+			var eventsToDispatch []any
+			patches, err := appstate.ParsePatchList(ctx, &respCollection, cli.downloadExternalAppStateBlob)
+			if err != nil {
+				return fmt.Errorf("%w (also, parsing patches in the response failed: %w)", mainErr, err)
+			} else if state, err = cli.applyAppStatePatches(ctx, patch.Type, state, patches, false, &eventsToDispatch); err != nil {
+				return fmt.Errorf("%w (also, applying patches in the response failed: %w)", mainErr, err)
+			} else {
+				zerolog.Ctx(ctx).Debug().Msg("Retrying app state send after applying conflicting patches")
+				go func() {
+					for _, evt := range eventsToDispatch {
+						cli.dispatchEvent(evt)
+					}
+				}()
+				return cli.sendChatNoteAppState(ctx, patch, false)
 			}
 		}
 		return mainErr

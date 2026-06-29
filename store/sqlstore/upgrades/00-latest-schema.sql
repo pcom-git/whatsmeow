@@ -1,4 +1,4 @@
--- v0 -> v14 (compatible with v8+): Latest schema
+-- v0 -> v16 (compatible with v8+): Latest schema
 CREATE TABLE whatsmeow_device (
 	jid TEXT PRIMARY KEY,
 	lid TEXT,
@@ -109,6 +109,115 @@ CREATE TABLE whatsmeow_contacts (
 	PRIMARY KEY (our_jid, their_jid),
 	FOREIGN KEY (our_jid) REFERENCES whatsmeow_device(jid) ON DELETE CASCADE ON UPDATE CASCADE
 );
+
+CREATE TABLE whatsmeow_groups (
+	our_jid                          TEXT    NOT NULL,
+	group_jid                        TEXT    NOT NULL,
+	owner_jid                        TEXT,
+	owner_pn                         TEXT,
+	name                             TEXT    NOT NULL DEFAULT '',
+	topic                            TEXT    NOT NULL DEFAULT '',
+	is_locked                        BOOLEAN NOT NULL DEFAULT false,
+	is_announce                      BOOLEAN NOT NULL DEFAULT false,
+	is_ephemeral                     BOOLEAN NOT NULL DEFAULT false,
+	disappearing_timer               BIGINT  NOT NULL DEFAULT 0,
+	is_incognito                     BOOLEAN NOT NULL DEFAULT false,
+	is_parent                        BOOLEAN NOT NULL DEFAULT false,
+	default_membership_approval_mode TEXT    NOT NULL DEFAULT '',
+	linked_parent_jid                TEXT,
+	is_default_sub_group             BOOLEAN NOT NULL DEFAULT false,
+	is_join_approval_required        BOOLEAN NOT NULL DEFAULT false,
+	participant_count                BIGINT  NOT NULL DEFAULT 0,
+	participant_version_id           TEXT    NOT NULL DEFAULT '',
+	member_add_mode                  TEXT    NOT NULL DEFAULT '',
+	suspended                        BOOLEAN NOT NULL DEFAULT false,
+	is_joined                        BOOLEAN NOT NULL DEFAULT true,
+	is_deleted                       BOOLEAN NOT NULL DEFAULT false,
+	last_sync_at                     BIGINT  NOT NULL DEFAULT 0,
+	updated_at                       BIGINT  NOT NULL DEFAULT 0,
+	raw_info                         TEXT,
+
+	PRIMARY KEY (our_jid, group_jid),
+	FOREIGN KEY (our_jid) REFERENCES whatsmeow_device(jid) ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+CREATE TABLE whatsmeow_group_members (
+	our_jid                TEXT    NOT NULL,
+	group_jid              TEXT    NOT NULL,
+	member_jid             TEXT    NOT NULL,
+	phone_number           TEXT,
+	lid                    TEXT,
+	display_name           TEXT    NOT NULL DEFAULT '',
+	is_admin               BOOLEAN NOT NULL DEFAULT false,
+	is_super_admin         BOOLEAN NOT NULL DEFAULT false,
+	status                 TEXT    NOT NULL DEFAULT 'active',
+	joined_at              BIGINT  NOT NULL DEFAULT 0,
+	left_at                BIGINT  NOT NULL DEFAULT 0,
+	participant_version_id TEXT    NOT NULL DEFAULT '',
+	updated_at             BIGINT  NOT NULL DEFAULT 0,
+
+	PRIMARY KEY (our_jid, group_jid, member_jid),
+	FOREIGN KEY (our_jid, group_jid) REFERENCES whatsmeow_groups(our_jid, group_jid) ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+CREATE INDEX idx_whatsmeow_groups_list
+ON whatsmeow_groups (our_jid, is_joined, is_deleted, name, group_jid);
+
+CREATE INDEX idx_whatsmeow_group_members_list
+ON whatsmeow_group_members (our_jid, group_jid, status, is_super_admin, is_admin, member_jid);
+
+CREATE INDEX idx_whatsmeow_group_members_member
+ON whatsmeow_group_members (our_jid, member_jid, status);
+
+CREATE TABLE whatsmeow_labels (
+	our_jid          TEXT    NOT NULL,
+	label_id         TEXT    NOT NULL,
+	name             TEXT    NOT NULL DEFAULT '',
+	type             INTEGER NOT NULL DEFAULT 0,
+	color            INTEGER NOT NULL DEFAULT 0,
+	predefined_id    INTEGER NOT NULL DEFAULT 0,
+	deleted          BOOLEAN NOT NULL DEFAULT false,
+	is_active        BOOLEAN NOT NULL DEFAULT true,
+	order_index      INTEGER NOT NULL DEFAULT 0,
+	is_immutable     BOOLEAN NOT NULL DEFAULT false,
+	mute_end_time_ms BIGINT  NOT NULL DEFAULT 0,
+	is_pending       BOOLEAN NOT NULL DEFAULT false,
+	last_event_time  BIGINT  NOT NULL DEFAULT 0,
+	from_full_sync   BOOLEAN NOT NULL DEFAULT false,
+	updated_at       BIGINT  NOT NULL,
+	raw_action       TEXT,
+
+	PRIMARY KEY (our_jid, label_id),
+	FOREIGN KEY (our_jid) REFERENCES whatsmeow_device(jid) ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+CREATE TABLE whatsmeow_label_members (
+	our_jid         TEXT    NOT NULL,
+	label_id        TEXT    NOT NULL,
+	chat_jid        TEXT    NOT NULL,
+	chat_type       TEXT    NOT NULL DEFAULT 'unknown',
+	labeled         BOOLEAN NOT NULL DEFAULT true,
+	source          TEXT    NOT NULL,
+	last_event_time BIGINT  NOT NULL DEFAULT 0,
+	from_full_sync  BOOLEAN NOT NULL DEFAULT false,
+	updated_at      BIGINT  NOT NULL,
+	raw_action      TEXT,
+
+	PRIMARY KEY (our_jid, label_id, chat_jid),
+	FOREIGN KEY (our_jid, label_id) REFERENCES whatsmeow_labels(our_jid, label_id) ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+CREATE INDEX idx_whatsmeow_labels_list
+ON whatsmeow_labels (our_jid, is_pending, deleted, is_active, order_index, label_id);
+
+CREATE INDEX idx_whatsmeow_labels_type
+ON whatsmeow_labels (our_jid, type, deleted, is_active);
+
+CREATE INDEX idx_whatsmeow_label_members_by_label
+ON whatsmeow_label_members (our_jid, label_id, labeled, chat_type, chat_jid);
+
+CREATE INDEX idx_whatsmeow_label_members_by_chat
+ON whatsmeow_label_members (our_jid, chat_jid, labeled);
 
 CREATE TABLE whatsmeow_chat_settings (
 	our_jid       TEXT,

@@ -140,6 +140,27 @@ func BuildMarkChatAsRead(target types.JID, read bool, lastMessageTimestamp time.
 	}
 }
 
+// BuildNoteEdit builds an app state patch for editing a chat note.
+func BuildNoteEdit(target types.JID, note string) PatchInfo {
+	noteType := waSyncAction.NoteEditAction_UNSTRUCTURED
+	return PatchInfo{
+		Type: WAPatchRegularLow,
+		Mutations: []MutationInfo{{
+			Index:   []string{IndexNoteEdit, target.String()},
+			Version: 5,
+			Value: &waSyncAction.SyncActionValue{
+				NoteEditAction: &waSyncAction.NoteEditAction{
+					Type:                noteType.Enum(),
+					ChatJID:             proto.String(target.String()),
+					CreatedAt:           proto.Int64(time.Now().UnixMilli()),
+					Deleted:             proto.Bool(false),
+					UnstructuredContent: proto.String(note),
+				},
+			},
+		}},
+	}
+}
+
 func newLabelChatMutation(target types.JID, labelID string, labeled bool) MutationInfo {
 	return MutationInfo{
 		Index:   []string{IndexLabelAssociationChat, labelID, target.String()},
@@ -205,6 +226,38 @@ func BuildLabelEdit(labelID string, labelName string, labelColor int32, deleted 
 		Mutations: []MutationInfo{
 			newLabelEditMutation(labelID, labelName, labelColor, deleted),
 		},
+	}
+}
+
+// BuildLabelEditFull builds an app state patch for creating or editing a label from a full
+// LabelEditAction value. Unlike BuildLabelEdit, this lets the caller set fields that the simple
+// builder doesn't expose, such as the label type (e.g. CUSTOM), isActive, predefinedID and orderIndex.
+//
+// This is primarily used by the high-level Client.CreateLabel/EditLabel/DeleteLabel helpers.
+func BuildLabelEditFull(labelID string, action *waSyncAction.LabelEditAction) PatchInfo {
+	return PatchInfo{
+		Type: WAPatchRegular,
+		Mutations: []MutationInfo{{
+			Index:   []string{IndexLabelEdit, labelID},
+			Version: 3,
+			Value: &waSyncAction.SyncActionValue{
+				LabelEditAction: action,
+			},
+		}},
+	}
+}
+
+// BuildLabelChatBatch builds a single app state patch that labels or unlabels multiple chats
+// (contacts or groups) with the same label. This lets callers add or remove many members in one
+// request instead of one patch per chat.
+func BuildLabelChatBatch(targets []types.JID, labelID string, labeled bool) PatchInfo {
+	mutations := make([]MutationInfo, 0, len(targets))
+	for _, target := range targets {
+		mutations = append(mutations, newLabelChatMutation(target, labelID, labeled))
+	}
+	return PatchInfo{
+		Type:      WAPatchRegular,
+		Mutations: mutations,
 	}
 }
 
