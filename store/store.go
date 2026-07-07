@@ -99,6 +99,26 @@ func (rpe RedactedPhoneEntry) GetMassInsertValues() [2]any {
 	return [...]any{rpe.JID.String(), rpe.RedactedPhone}
 }
 
+type ContactListPageOptions struct {
+	Page     int
+	PageSize int
+}
+
+type ContactListPageEntry struct {
+	JID  types.JID
+	LID  types.JID
+	Info types.ContactInfo
+}
+
+type ContactListPage struct {
+	List       []ContactListPageEntry
+	Page       int
+	PageSize   int
+	Total      int
+	TotalPages int
+	HasMore    bool
+}
+
 type ContactStore interface {
 	PutPushName(ctx context.Context, user types.JID, pushName string) (bool, string, error)
 	PutBusinessName(ctx context.Context, user types.JID, businessName string) (bool, string, error)
@@ -107,6 +127,197 @@ type ContactStore interface {
 	PutManyRedactedPhones(ctx context.Context, entries []RedactedPhoneEntry) error
 	GetContact(ctx context.Context, user types.JID) (types.ContactInfo, error)
 	GetAllContacts(ctx context.Context) (map[types.JID]types.ContactInfo, error)
+	GetContactListPage(ctx context.Context, options ContactListPageOptions) (ContactListPage, error)
+}
+
+type GroupListPageOptions struct {
+	Page        int
+	PageSize    int
+	Keyword     string
+	IncludeLeft bool
+}
+
+type GroupListPageEntry struct {
+	GroupID                       string
+	OwnerJID                      string
+	Name                          string
+	Topic                         string
+	IsLocked                      bool
+	IsAnnounce                    bool
+	IsEphemeral                   bool
+	DisappearingTimer             uint32
+	IsIncognito                   bool
+	IsParent                      bool
+	DefaultMembershipApprovalMode string
+	LinkedParentID                string
+	IsDefaultSubGroup             bool
+	IsJoinApprovalRequired        bool
+	ParticipantCount              int
+	MemberAddMode                 types.GroupMemberAddMode
+	Suspended                     bool
+}
+
+type GroupListPage struct {
+	List       []GroupListPageEntry
+	Page       int
+	PageSize   int
+	Total      int
+	TotalPages int
+	HasMore    bool
+}
+
+type GroupMemberListPageOptions struct {
+	GroupJID types.JID
+	Page     int
+	PageSize int
+	Status   string
+	Role     string
+	Keyword  string
+}
+
+type GroupMemberListPageEntry struct {
+	JID          string
+	PhoneNumber  string
+	LID          string
+	DisplayName  string
+	IsAdmin      bool
+	IsSuperAdmin bool
+	Status       string
+}
+
+type GroupMemberListPage struct {
+	List       []GroupMemberListPageEntry
+	Page       int
+	PageSize   int
+	Total      int
+	TotalPages int
+	HasMore    bool
+}
+
+const (
+	LabelChatTypeContact = "contact"
+	LabelChatTypeGroup   = "group"
+	LabelChatTypeUnknown = "unknown"
+
+	LabelSourceAssociation = "label_jid"
+	LabelSourceFavorites   = "favorites"
+
+	LabelTypeFavorites int32 = 3
+)
+
+type LabelInfo struct {
+	LabelID       string
+	Name          string
+	Type          int32
+	Color         int32
+	PredefinedID  int32
+	Deleted       bool
+	IsActive      bool
+	OrderIndex    int32
+	IsImmutable   bool
+	MuteEndTimeMS int64
+	IsPending     bool
+	LastEventTime time.Time
+	FromFullSync  bool
+	MemberCount   *int
+	RawAction     string
+}
+
+type LabelMemberInfo struct {
+	LabelID       string
+	ChatJID       types.JID
+	ChatType      string
+	DisplayName   string
+	Labeled       bool
+	Source        string
+	LastEventTime time.Time
+	FromFullSync  bool
+	RawAction     string
+}
+
+type LabelListPageOptions struct {
+	Page            int
+	PageSize        int
+	IncludeDeleted  bool
+	IncludeInactive bool
+	Type            *int32
+	IncludeCounts   bool
+}
+
+type LabelListPage struct {
+	List       []LabelInfo
+	Page       int
+	PageSize   int
+	Total      int
+	TotalPages int
+	HasMore    bool
+}
+
+type LabelMemberListPageOptions struct {
+	Page             int
+	PageSize         int
+	ChatType         string
+	IncludeUnlabeled bool
+}
+
+type LabelMemberListPage struct {
+	List       []LabelMemberInfo
+	Page       int
+	PageSize   int
+	Total      int
+	TotalPages int
+	HasMore    bool
+}
+
+type LabelStore interface {
+	PutLabel(ctx context.Context, label LabelInfo) error
+	PutLabelMember(ctx context.Context, member LabelMemberInfo) error
+	ReplaceFavoriteMembers(ctx context.Context, members []types.JID, ts time.Time, fromFullSync bool) error
+	GetLabels(ctx context.Context, options LabelListPageOptions) (LabelListPage, error)
+	GetLabelMembers(ctx context.Context, labelID string, options LabelMemberListPageOptions) (LabelMemberListPage, error)
+}
+
+func LabelChatTypeForJID(jid types.JID) string {
+	switch jid.Server {
+	case types.GroupServer:
+		return LabelChatTypeGroup
+	case types.DefaultUserServer, types.HiddenUserServer:
+		return LabelChatTypeContact
+	default:
+		return LabelChatTypeUnknown
+	}
+}
+
+type GroupInfoEvent struct {
+	JID       types.JID
+	Sender    *types.JID
+	SenderPN  *types.JID
+	Timestamp time.Time
+
+	Name                   *types.GroupName
+	Topic                  *types.GroupTopic
+	Locked                 *types.GroupLocked
+	Announce               *types.GroupAnnounce
+	Ephemeral              *types.GroupEphemeral
+	MembershipApprovalMode *types.GroupMembershipApprovalMode
+	Delete                 *types.GroupDelete
+
+	ParticipantVersionID string
+	Join                 []types.JID
+	Leave                []types.JID
+	Promote              []types.JID
+	Demote               []types.JID
+	Suspended            bool
+	Unsuspended          bool
+}
+
+type GroupStore interface {
+	PutJoinedGroupsSnapshot(ctx context.Context, groups []*types.GroupInfo, syncedAt time.Time) error
+	PutGroupInfoSnapshot(ctx context.Context, group *types.GroupInfo, syncedAt time.Time) error
+	PutGroupInfoEvent(ctx context.Context, evt *GroupInfoEvent) error
+	GetGroupListPage(ctx context.Context, options GroupListPageOptions) (GroupListPage, error)
+	GetGroup(ctx context.Context, groupJID types.JID) (*GroupListPageEntry, error)
+	GetGroupMemberListPage(ctx context.Context, options GroupMemberListPageOptions) (GroupMemberListPage, error)
 }
 
 var MutedForever = time.Date(9999, 12, 31, 23, 59, 59, 999999999, time.UTC)
@@ -198,6 +409,8 @@ type AllSessionSpecificStores interface {
 	AppStateSyncKeyStore
 	AppStateStore
 	ContactStore
+	GroupStore
+	LabelStore
 	ChatSettingsStore
 	MsgSecretStore
 	PrivacyTokenStore
@@ -244,6 +457,8 @@ type Device struct {
 	AppStateKeys  AppStateSyncKeyStore
 	AppState      AppStateStore
 	Contacts      ContactStore
+	Groups        GroupStore
+	Labels        LabelStore
 	ChatSettings  ChatSettingsStore
 	MsgSecrets    MsgSecretStore
 	PrivacyTokens PrivacyTokenStore
@@ -303,6 +518,8 @@ func (device *Device) SetAllStores(store AllSessionSpecificStores) {
 	device.AppStateKeys = store
 	device.AppState = store
 	device.Contacts = store
+	device.Groups = store
+	device.Labels = store
 	device.ChatSettings = store
 	device.MsgSecrets = store
 	device.PrivacyTokens = store

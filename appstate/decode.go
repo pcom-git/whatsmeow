@@ -40,7 +40,7 @@ func parseSnapshotInternal(ctx context.Context, collection *waBinary.Node, downl
 	rawSnapshot, ok := snapshotNode.Content.([]byte)
 	if snapshotNode.Tag != "snapshot" || !ok {
 		return nil, nil
-	}
+	}  
 	var snapshot waServerSync.ExternalBlobReference
 	err := proto.Unmarshal(rawSnapshot, &snapshot)
 	if err != nil {

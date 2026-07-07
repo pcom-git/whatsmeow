@@ -604,6 +604,30 @@ const (
 	getAllContactsQuery = `
 		SELECT their_jid, first_name, full_name, push_name, business_name, redacted_phone FROM whatsmeow_contacts WHERE our_jid=$1
 	`
+	getContactListPageCountQuery = `
+		SELECT COUNT(*)
+		FROM whatsmeow_contacts
+		WHERE our_jid = $1
+		  AND TRIM(COALESCE(full_name, '')) <> ''
+	`
+	getContactListPageQuery = `
+		SELECT
+			c.their_jid,
+			c.first_name,
+			c.full_name,
+			c.push_name,
+			c.business_name,
+			c.redacted_phone,
+			lm.lid
+		FROM whatsmeow_contacts c
+		LEFT JOIN whatsmeow_lid_map lm
+		  ON c.their_jid LIKE '%@s.whatsapp.net'
+		 AND replace(c.their_jid, '@s.whatsapp.net', '') = lm.pn
+		WHERE c.our_jid = $1
+		  AND TRIM(COALESCE(c.full_name, '')) <> ''
+		ORDER BY c.their_jid ASC
+		LIMIT $2 OFFSET $3
+	`
 )
 
 var putContactNamesMassInsertBuilder = dbutil.NewMassInsertBuilder[store.ContactEntry, [1]any](
@@ -812,6 +836,73 @@ func (s *SQLStore) GetAllContacts(ctx context.Context) (map[types.JID]types.Cont
 		return true, nil
 	})
 	return output, err
+}
+
+func normalizeContactListPageOptions(options store.ContactListPageOptions) store.ContactListPageOptions {
+	if options.Page <= 0 {
+		options.Page = 1
+	}
+	if options.PageSize <= 0 {
+		options.PageSize = 50
+	} else if options.PageSize > 500 {
+		options.PageSize = 500
+	}
+	return options
+}
+
+func (s *SQLStore) GetContactListPage(ctx context.Context, options store.ContactListPageOptions) (store.ContactListPage, error) {
+	options = normalizeContactListPageOptions(options)
+	page := store.ContactListPage{
+		List:     []store.ContactListPageEntry{},
+		Page:     options.Page,
+		PageSize: options.PageSize,
+	}
+
+	err := s.db.QueryRow(ctx, getContactListPageCountQuery, s.JID).Scan(&page.Total)
+	if err != nil {
+		return page, err
+	}
+	if page.Total > 0 {
+		page.TotalPages = (page.Total + options.PageSize - 1) / options.PageSize
+		page.HasMore = options.Page < page.TotalPages
+	}
+
+	offset := (options.Page - 1) * options.PageSize
+	rows, err := s.db.Query(ctx, getContactListPageQuery, s.JID, options.PageSize, offset)
+	if err != nil {
+		return page, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var jid types.JID
+		var first, full, push, business, redactedPhone, lidUser sql.NullString
+		err = rows.Scan(&jid, &first, &full, &push, &business, &redactedPhone, &lidUser)
+		if err != nil {
+			return page, fmt.Errorf("error scanning row: %w", err)
+		}
+
+		var lid types.JID
+		if jid.Server == types.HiddenUserServer {
+			lid = jid
+		} else if jid.Server == types.DefaultUserServer && lidUser.Valid && lidUser.String != "" {
+			lid = types.JID{User: lidUser.String, Server: types.HiddenUserServer}
+		}
+
+		page.List = append(page.List, store.ContactListPageEntry{
+			JID: jid,
+			LID: lid,
+			Info: types.ContactInfo{
+				Found:         true,
+				FirstName:     first.String,
+				FullName:      full.String,
+				PushName:      push.String,
+				BusinessName:  business.String,
+				RedactedPhone: redactedPhone.String,
+			},
+		})
+	}
+	return page, rows.Err()
 }
 
 const (

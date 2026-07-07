@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/store"
@@ -554,6 +555,12 @@ func (cli *Client) GetJoinedGroups(ctx context.Context) ([]*types.GroupInfo, err
 	if err != nil {
 		cli.Log.Warnf("Failed to store redacted phones from joined groups: %v", err)
 	}
+	if cli.Store.Groups != nil {
+		err = cli.Store.Groups.PutJoinedGroupsSnapshot(ctx, infos, time.Now())
+		if err != nil {
+			cli.Log.Warnf("Failed to store joined groups snapshot: %v", err)
+		}
+	}
 	return infos, nil
 }
 
@@ -603,6 +610,56 @@ func (cli *Client) GetLinkedGroupsParticipants(ctx context.Context, community ty
 // GetGroupInfo requests basic info about a group chat from the WhatsApp servers.
 func (cli *Client) GetGroupInfo(ctx context.Context, jid types.JID) (*types.GroupInfo, error) {
 	return cli.getGroupInfo(ctx, jid, true)
+}
+
+// GetStoredGroupListPage returns a page of locally stored group metadata without making network requests.
+func (cli *Client) GetStoredGroupListPage(ctx context.Context, opts store.GroupListPageOptions) (store.GroupListPage, error) {
+	if cli.Store == nil || cli.Store.Groups == nil {
+		return store.GroupListPage{}, fmt.Errorf("group store is nil")
+	}
+	return cli.Store.Groups.GetGroupListPage(ctx, opts)
+}
+
+// GetStoredGroup returns locally stored metadata for one group without making network requests.
+func (cli *Client) GetStoredGroup(ctx context.Context, groupJID types.JID) (*store.GroupListPageEntry, error) {
+	if cli.Store == nil || cli.Store.Groups == nil {
+		return nil, fmt.Errorf("group store is nil")
+	}
+	return cli.Store.Groups.GetGroup(ctx, groupJID)
+}
+
+// GetStoredGroupMemberListPage returns a page of locally stored group members without making network requests.
+func (cli *Client) GetStoredGroupMemberListPage(ctx context.Context, opts store.GroupMemberListPageOptions) (store.GroupMemberListPage, error) {
+	if cli.Store == nil || cli.Store.Groups == nil {
+		return store.GroupMemberListPage{}, fmt.Errorf("group store is nil")
+	}
+	return cli.Store.Groups.GetGroupMemberListPage(ctx, opts)
+}
+
+func groupInfoEventToStore(evt *events.GroupInfo) *store.GroupInfoEvent {
+	if evt == nil {
+		return nil
+	}
+	return &store.GroupInfoEvent{
+		JID:                    evt.JID,
+		Sender:                 evt.Sender,
+		SenderPN:               evt.SenderPN,
+		Timestamp:              evt.Timestamp,
+		Name:                   evt.Name,
+		Topic:                  evt.Topic,
+		Locked:                 evt.Locked,
+		Announce:               evt.Announce,
+		Ephemeral:              evt.Ephemeral,
+		MembershipApprovalMode: evt.MembershipApprovalMode,
+		Delete:                 evt.Delete,
+		ParticipantVersionID:   evt.ParticipantVersionID,
+		Join:                   evt.Join,
+		Leave:                  evt.Leave,
+		Promote:                evt.Promote,
+		Demote:                 evt.Demote,
+		Suspended:              evt.Suspended,
+		Unsuspended:            evt.Unsuspended,
+	}
 }
 
 func (cli *Client) cacheGroupInfo(groupInfo *types.GroupInfo, lock bool) ([]store.LIDMapping, []store.RedactedPhoneEntry) {
@@ -665,6 +722,12 @@ func (cli *Client) getGroupInfo(ctx context.Context, jid types.JID, lockParticip
 	err = cli.Store.Contacts.PutManyRedactedPhones(ctx, redactedPhones)
 	if err != nil {
 		cli.Log.Warnf("Failed to store redacted phones for members of %s: %v", jid, err)
+	}
+	if cli.Store.Groups != nil {
+		err = cli.Store.Groups.PutGroupInfoSnapshot(ctx, groupInfo, time.Now())
+		if err != nil {
+			cli.Log.Warnf("Failed to store group info snapshot for %s: %v", jid, err)
+		}
 	}
 	return groupInfo, nil
 }
@@ -965,8 +1028,10 @@ func (cli *Client) parseGroupChange(node *waBinary.Node) (*events.GroupInfo, []s
 				return nil, nil, fmt.Errorf("failed to parse group unlink node in group change: %w", err)
 			}
 		case "membership_approval_mode":
+			groupJoin := child.GetChildByTag("group_join")
+			state := groupJoin.AttrGetter().OptionalString("state")
 			evt.MembershipApprovalMode = &types.GroupMembershipApprovalMode{
-				IsJoinApprovalRequired: true,
+				IsJoinApprovalRequired: state != "off",
 			}
 		case "suspended":
 			evt.Suspended = true
