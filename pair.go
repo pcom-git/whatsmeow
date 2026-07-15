@@ -116,7 +116,7 @@ func (cli *Client) makeQRData(ref []byte, clientType PairClientType) string {
 	noise := base64.StdEncoding.EncodeToString(cli.Store.NoiseKey.Pub[:])
 	identity := base64.StdEncoding.EncodeToString(cli.Store.IdentityKey.Pub[:])
 	adv := base64.StdEncoding.EncodeToString(cli.Store.AdvSecretKey)
-	return fmt.Sprintf("https://wa.me/settings/linked_devices#%s,%s,%s,%s,%s", ref, noise, identity, adv, clientType)
+	return fmt.Sprintf("%s,%s,%s,%s,%s", ref, noise, identity, adv, clientType)
 }
 
 func (cli *Client) handlePairSuccess(ctx context.Context, node *waBinary.Node) {
