@@ -727,25 +727,114 @@ func (s *SQLStore) GetGroup(ctx context.Context, groupJID types.JID) (*store.Gro
 	return &entry, nil
 }
 
+// groupMemberListResolvedSelect resolves the phone number and LID identities for
+// each group member, then computes the public display name from the contact
+// store. The group protocol's display_name is an obfuscated phone number, not a
+// human name, so it is only used after all real names and a known phone number.
+const groupMemberListResolvedSelect = `
+	SELECT
+		identified.our_jid,
+		identified.group_jid,
+		identified.member_jid,
+		identified.phone_number,
+		identified.lid,
+		COALESCE(
+			NULLIF(pn_contact.full_name, ''),
+			NULLIF(lid_contact.full_name, ''),
+			NULLIF(pn_contact.first_name, ''),
+			NULLIF(lid_contact.first_name, ''),
+			NULLIF(pn_contact.business_name, ''),
+			NULLIF(lid_contact.business_name, ''),
+			NULLIF(pn_contact.push_name, ''),
+			NULLIF(lid_contact.push_name, ''),
+			CASE
+				WHEN identified.resolved_phone_jid <> ''
+					THEN '+' || replace(identified.resolved_phone_jid, '@s.whatsapp.net', '')
+			END,
+			NULLIF(pn_contact.redacted_phone, ''),
+			NULLIF(lid_contact.redacted_phone, ''),
+			NULLIF(identified.protocol_display_name, ''),
+			''
+		) AS display_name,
+		identified.is_admin,
+		identified.is_super_admin,
+		identified.status
+	FROM (
+		SELECT
+			gm.our_jid,
+			gm.group_jid,
+			gm.member_jid,
+			COALESCE(gm.phone_number, '') AS phone_number,
+			COALESCE(gm.lid, '') AS lid,
+			gm.display_name AS protocol_display_name,
+			gm.is_admin,
+			gm.is_super_admin,
+			gm.status,
+			COALESCE(
+				CASE
+					WHEN COALESCE(gm.phone_number, '') LIKE '%@s.whatsapp.net' THEN gm.phone_number
+				END,
+				CASE
+					WHEN gm.member_jid LIKE '%@s.whatsapp.net' THEN gm.member_jid
+				END,
+				CASE
+					WHEN map_by_lid.pn IS NOT NULL THEN map_by_lid.pn || '@s.whatsapp.net'
+				END,
+				''
+			) AS resolved_phone_jid,
+			COALESCE(
+				CASE
+					WHEN COALESCE(gm.lid, '') LIKE '%@lid' THEN gm.lid
+				END,
+				CASE
+					WHEN gm.member_jid LIKE '%@lid' THEN gm.member_jid
+				END,
+				CASE
+					WHEN map_by_pn.lid IS NOT NULL THEN map_by_pn.lid || '@lid'
+				END,
+				''
+			) AS resolved_lid_jid
+		FROM whatsmeow_group_members gm
+		LEFT JOIN whatsmeow_lid_map map_by_lid
+		  ON map_by_lid.lid=CASE
+			WHEN COALESCE(gm.lid, '') LIKE '%@lid' THEN replace(gm.lid, '@lid', '')
+			WHEN gm.member_jid LIKE '%@lid' THEN replace(gm.member_jid, '@lid', '')
+		  END
+		LEFT JOIN whatsmeow_lid_map map_by_pn
+		  ON map_by_pn.pn=CASE
+			WHEN COALESCE(gm.phone_number, '') LIKE '%@s.whatsapp.net'
+				THEN replace(gm.phone_number, '@s.whatsapp.net', '')
+			WHEN gm.member_jid LIKE '%@s.whatsapp.net'
+				THEN replace(gm.member_jid, '@s.whatsapp.net', '')
+		  END
+	) identified
+	LEFT JOIN whatsmeow_contacts pn_contact
+	  ON pn_contact.our_jid=identified.our_jid
+	 AND pn_contact.their_jid=identified.resolved_phone_jid
+	LEFT JOIN whatsmeow_contacts lid_contact
+	  ON lid_contact.our_jid=identified.our_jid
+	 AND lid_contact.their_jid=identified.resolved_lid_jid
+`
+
 func buildGroupMemberListWhere(options store.GroupMemberListPageOptions) (string, []any) {
 	args := []any{nil, jidString(options.GroupJID)}
-	conditions := []string{"our_jid=$1", "group_jid=$2"}
+	conditions := []string{"resolved_member.our_jid=$1", "resolved_member.group_jid=$2"}
 	if options.Status != groupMemberStatusAll {
-		conditions = append(conditions, "status="+appendSQLArg(&args, options.Status))
+		conditions = append(conditions, "resolved_member.status="+appendSQLArg(&args, options.Status))
 	}
 	switch options.Role {
 	case groupMemberRoleAdmin:
-		conditions = append(conditions, "(is_admin=true OR is_super_admin=true)")
+		conditions = append(conditions, "(resolved_member.is_admin=true OR resolved_member.is_super_admin=true)")
 	case groupMemberRoleMember:
-		conditions = append(conditions, "is_admin=false AND is_super_admin=false")
+		conditions = append(conditions, "resolved_member.is_admin=false AND resolved_member.is_super_admin=false")
 	}
 	if options.Keyword != "" {
 		placeholder := appendSQLArg(&args, "%"+strings.ToLower(options.Keyword)+"%")
 		conditions = append(conditions, fmt.Sprintf(`(
-			LOWER(member_jid) LIKE %[1]s OR
-			LOWER(COALESCE(phone_number, '')) LIKE %[1]s OR
-			LOWER(COALESCE(lid, '')) LIKE %[1]s OR
-			LOWER(COALESCE(display_name, '')) LIKE %[1]s
+			LOWER(resolved_member.member_jid) LIKE %[1]s OR
+			LOWER(resolved_member.phone_number) LIKE %[1]s OR
+			LOWER(resolved_member.lid) LIKE %[1]s OR
+			LOWER(resolved_member.display_name) LIKE %[1]s
 		)`, placeholder))
 	}
 	return " WHERE " + strings.Join(conditions, " AND "), args
@@ -768,7 +857,8 @@ func (s *SQLStore) GetGroupMemberListPage(ctx context.Context, options store.Gro
 	where, args := buildGroupMemberListWhere(options)
 	args[0] = s.JID
 
-	countQuery := "SELECT COUNT(*) FROM whatsmeow_group_members" + where
+	resolvedMembersFrom := " FROM (" + groupMemberListResolvedSelect + ") resolved_member"
+	countQuery := "SELECT COUNT(*)" + resolvedMembersFrom + where
 	if err := s.db.QueryRow(ctx, countQuery, args...).Scan(&page.Total); err != nil {
 		return page, err
 	}
@@ -780,11 +870,12 @@ func (s *SQLStore) GetGroupMemberListPage(ctx context.Context, options store.Gro
 	offset := (options.Page - 1) * options.PageSize
 	listArgs := append(args, options.PageSize, offset)
 	listQuery := `
-		SELECT member_jid, COALESCE(phone_number, ''), COALESCE(lid, ''), display_name,
-		       is_admin, is_super_admin, status
-		FROM whatsmeow_group_members
-	` + where + `
-		ORDER BY is_super_admin DESC, is_admin DESC, LOWER(COALESCE(display_name, '')) ASC, member_jid ASC
+		SELECT resolved_member.member_jid, resolved_member.phone_number, resolved_member.lid,
+		       resolved_member.display_name, resolved_member.is_admin,
+		       resolved_member.is_super_admin, resolved_member.status
+	` + resolvedMembersFrom + where + `
+		ORDER BY resolved_member.is_super_admin DESC, resolved_member.is_admin DESC,
+		         LOWER(resolved_member.display_name) ASC, resolved_member.member_jid ASC
 		LIMIT $` + fmt.Sprint(len(listArgs)-1) + ` OFFSET $` + fmt.Sprint(len(listArgs))
 	rows, err := s.db.Query(ctx, listQuery, listArgs...)
 	if err != nil {
