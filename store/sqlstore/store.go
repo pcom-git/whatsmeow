@@ -305,13 +305,31 @@ func (s *SQLStore) MigratePNToLID(ctx context.Context, pn, lid types.JID) error 
 }
 
 const (
-	getLastPreKeyIDQuery        = `SELECT MAX(key_id) FROM whatsmeow_pre_keys WHERE jid=$1`
-	insertPreKeyQuery           = `INSERT INTO whatsmeow_pre_keys (jid, key_id, key, uploaded) VALUES ($1, $2, $3, $4)`
-	getUnuploadedPreKeysQuery   = `SELECT key_id, key FROM whatsmeow_pre_keys WHERE jid=$1 AND uploaded=false ORDER BY key_id LIMIT $2`
-	getPreKeyQuery              = `SELECT key_id, key FROM whatsmeow_pre_keys WHERE jid=$1 AND key_id=$2`
-	deletePreKeyQuery           = `DELETE FROM whatsmeow_pre_keys WHERE jid=$1 AND key_id=$2`
-	markPreKeysAsUploadedQuery  = `UPDATE whatsmeow_pre_keys SET uploaded=true WHERE jid=$1 AND key_id<=$2`
-	getUploadedPreKeyCountQuery = `SELECT COUNT(*) FROM whatsmeow_pre_keys WHERE jid=$1 AND uploaded=true`
+	preKeyServerIDMin uint32 = 1
+	preKeyServerIDMax uint32 = 16_000_000
+	preKeyRetryIDMin  uint32 = preKeyServerIDMax + 1
+	preKeyRetryIDMax  uint32 = 16_777_214
+
+	maxRetryPreKeyCount     = 5_000
+	retryPreKeyCleanupBatch = 1_000
+
+	getLastPreKeyIDQuery          = `SELECT MAX(key_id) FROM whatsmeow_pre_keys WHERE jid=$1 AND key_id BETWEEN $2 AND $3`
+	insertPreKeyQuery             = `INSERT INTO whatsmeow_pre_keys (jid, key_id, key, uploaded) VALUES ($1, $2, $3, $4)`
+	getUnuploadedPreKeysQuery     = `SELECT key_id, key FROM whatsmeow_pre_keys WHERE jid=$1 AND uploaded=false AND key_id BETWEEN $2 AND $3 ORDER BY key_id LIMIT $4`
+	getPreKeyQuery                = `SELECT key_id, key FROM whatsmeow_pre_keys WHERE jid=$1 AND key_id=$2`
+	deletePreKeyQuery             = `DELETE FROM whatsmeow_pre_keys WHERE jid=$1 AND key_id=$2`
+	getRetryPreKeyCountQuery      = `SELECT COUNT(*) FROM whatsmeow_pre_keys WHERE jid=$1 AND key_id BETWEEN $2 AND $3`
+	deleteOldestRetryPreKeysQuery = `
+		DELETE FROM whatsmeow_pre_keys
+		WHERE jid=$1 AND key_id IN (
+			SELECT key_id FROM whatsmeow_pre_keys
+			WHERE jid=$1 AND key_id BETWEEN $2 AND $3
+			ORDER BY key_id
+			LIMIT $4
+		)
+	`
+	markPreKeysAsUploadedQuery  = `UPDATE whatsmeow_pre_keys SET uploaded=true WHERE jid=$1 AND key_id BETWEEN $2 AND $3 AND key_id<=$4`
+	getUploadedPreKeyCountQuery = `SELECT COUNT(*) FROM whatsmeow_pre_keys WHERE jid=$1 AND uploaded=true AND key_id BETWEEN $2 AND $3`
 )
 
 func (s *SQLStore) genOnePreKey(ctx context.Context, id uint32, markUploaded bool) (*keys.PreKey, error) {
@@ -320,30 +338,78 @@ func (s *SQLStore) genOnePreKey(ctx context.Context, id uint32, markUploaded boo
 	return key, err
 }
 
-func (s *SQLStore) getNextPreKeyID(ctx context.Context) (uint32, error) {
-	var lastKeyID sql.NullInt32
-	err := s.db.QueryRow(ctx, getLastPreKeyIDQuery, s.JID).Scan(&lastKeyID)
+func (s *SQLStore) getNextPreKeyID(ctx context.Context, minID, maxID uint32) (uint32, error) {
+	var lastKeyID sql.NullInt64
+	err := s.db.QueryRow(ctx, getLastPreKeyIDQuery, s.JID, minID, maxID).Scan(&lastKeyID)
 	if err != nil {
 		return 0, fmt.Errorf("failed to query next prekey ID: %w", err)
 	}
-	return uint32(lastKeyID.Int32) + 1, nil
+	if !lastKeyID.Valid {
+		return minID, nil
+	} else if lastKeyID.Int64 < int64(minID) || lastKeyID.Int64 > int64(maxID) {
+		return 0, fmt.Errorf("database returned prekey ID %d outside range %d..%d", lastKeyID.Int64, minID, maxID)
+	} else if lastKeyID.Int64 < int64(maxID) {
+		return uint32(lastKeyID.Int64) + 1, nil
+	}
+	return 0, fmt.Errorf("prekey ID range %d..%d is exhausted", minID, maxID)
 }
 
 func (s *SQLStore) GenOnePreKey(ctx context.Context) (*keys.PreKey, error) {
 	s.preKeyLock.Lock()
 	defer s.preKeyLock.Unlock()
-	nextKeyID, err := s.getNextPreKeyID(ctx)
+	nextKeyID, err := s.getNextPreKeyID(ctx, preKeyServerIDMin, preKeyServerIDMax)
 	if err != nil {
 		return nil, err
 	}
 	return s.genOnePreKey(ctx, nextKeyID, true)
 }
 
+// GenOneRetryPreKey generates a prekey in the private retry-only ID range.
+// It intentionally isn't part of store.PreKeyStore: retry handling discovers
+// this method through an optional private interface and falls back for stores
+// that don't implement it.
+func (s *SQLStore) GenOneRetryPreKey(ctx context.Context) (*keys.PreKey, error) {
+	s.preKeyLock.Lock()
+	defer s.preKeyLock.Unlock()
+
+	var retryPreKeyCount int
+	err := s.db.QueryRow(ctx, getRetryPreKeyCountQuery, s.JID, preKeyRetryIDMin, preKeyRetryIDMax).Scan(&retryPreKeyCount)
+	if err != nil {
+		return nil, fmt.Errorf("failed to count retry prekeys: %w", err)
+	}
+	if retryPreKeyCount > maxRetryPreKeyCount {
+		_, err = s.db.Exec(
+			ctx,
+			deleteOldestRetryPreKeysQuery,
+			s.JID,
+			preKeyRetryIDMin,
+			preKeyRetryIDMax,
+			retryPreKeyCleanupBatch,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to clean up retry prekeys: %w", err)
+		}
+	}
+
+	nextKeyID, err := s.getNextPreKeyID(ctx, preKeyRetryIDMin, preKeyRetryIDMax)
+	if err != nil {
+		return nil, err
+	}
+	return s.genOnePreKey(ctx, nextKeyID, false)
+}
+
 func (s *SQLStore) GetOrGenPreKeys(ctx context.Context, count uint32) ([]*keys.PreKey, error) {
 	s.preKeyLock.Lock()
 	defer s.preKeyLock.Unlock()
 
-	newKeys, err := scanPreKey.NewRowIter(s.db.Query(ctx, getUnuploadedPreKeysQuery, s.JID, count)).AsList()
+	newKeys, err := scanPreKey.NewRowIter(s.db.Query(
+		ctx,
+		getUnuploadedPreKeysQuery,
+		s.JID,
+		preKeyServerIDMin,
+		preKeyServerIDMax,
+		count,
+	)).AsList()
 	if err != nil {
 		return nil, fmt.Errorf("failed to query existing prekeys: %w", err)
 	}
@@ -351,9 +417,13 @@ func (s *SQLStore) GetOrGenPreKeys(ctx context.Context, count uint32) ([]*keys.P
 	alreadyGeneratedCount := uint32(len(newKeys))
 	if count > alreadyGeneratedCount {
 		var nextKeyID uint32
-		nextKeyID, err = s.getNextPreKeyID(ctx)
+		nextKeyID, err = s.getNextPreKeyID(ctx, preKeyServerIDMin, preKeyServerIDMax)
 		if err != nil {
 			return nil, err
+		}
+		generateCount := count - alreadyGeneratedCount
+		if uint64(nextKeyID)+uint64(generateCount)-1 > uint64(preKeyServerIDMax) {
+			return nil, fmt.Errorf("not enough IDs left in server prekey range for %d keys", generateCount)
 		}
 		newKeys = slices.Grow(newKeys, int(count)-len(newKeys))[:count]
 		for i := alreadyGeneratedCount; i < count; i++ {
@@ -395,12 +465,12 @@ func (s *SQLStore) RemovePreKey(ctx context.Context, id uint32) error {
 }
 
 func (s *SQLStore) MarkPreKeysAsUploaded(ctx context.Context, upToID uint32) error {
-	_, err := s.db.Exec(ctx, markPreKeysAsUploadedQuery, s.JID, upToID)
+	_, err := s.db.Exec(ctx, markPreKeysAsUploadedQuery, s.JID, preKeyServerIDMin, preKeyServerIDMax, upToID)
 	return err
 }
 
 func (s *SQLStore) UploadedPreKeyCount(ctx context.Context) (count int, err error) {
-	err = s.db.QueryRow(ctx, getUploadedPreKeyCountQuery, s.JID).Scan(&count)
+	err = s.db.QueryRow(ctx, getUploadedPreKeyCountQuery, s.JID, preKeyServerIDMin, preKeyServerIDMax).Scan(&count)
 	return
 }
 

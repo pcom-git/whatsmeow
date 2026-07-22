@@ -95,7 +95,7 @@ type Client struct {
 	AppStateDebugLogs            bool
 
 	AutomaticMessageRerequestFromPhone bool
-	pendingPhoneRerequests             map[types.MessageID]context.CancelFunc
+	pendingPhoneRerequests             map[messageRetryKey]phoneRerequestState
 	pendingPhoneRerequestsLock         sync.RWMutex
 
 	appStateProc     *appstate.Processor
@@ -120,8 +120,9 @@ type Client struct {
 	eventHandlers     []wrappedEventHandler
 	eventHandlersLock sync.RWMutex
 
-	messageRetries     map[string]int
+	messageRetries     map[messageRetryKey]int
 	messageRetriesLock sync.Mutex
+	retryLocks         [retryLockCount]sync.Mutex
 	retrySema          *semaphore.Weighted
 
 	incomingRetryRequestCounter     map[incomingRetryKey]int
@@ -260,7 +261,7 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 		uniqueID:           fmt.Sprintf("%d.%d-", uniqueIDPrefix[0], uniqueIDPrefix[1]),
 		responseWaiters:    make(map[string]chan<- *waBinary.Node),
 		eventHandlers:      make([]wrappedEventHandler, 0, 1),
-		messageRetries:     make(map[string]int),
+		messageRetries:     make(map[messageRetryKey]int),
 		handlerQueue:       make(chan *waBinary.Node, handlerQueueSize),
 		appStateProc:       appstate.NewProcessor(deviceStore, log.Sub("AppState")),
 		socketWait:         make(chan struct{}),
@@ -279,7 +280,7 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 		GetMessageForRetry:     func(requester, to types.JID, id types.MessageID) *waE2E.Message { return nil },
 		appStateKeyRequests:    make(map[string]time.Time),
 
-		pendingPhoneRerequests: make(map[types.MessageID]context.CancelFunc),
+		pendingPhoneRerequests: make(map[messageRetryKey]phoneRerequestState),
 
 		EnableAutoReconnect: true,
 		AutoTrustIdentity:   true,

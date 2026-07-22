@@ -334,6 +334,7 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 		}
 	}
 	var recognizedStanza, protobufFailed bool
+	allEncryptedChildrenSucceeded := true
 	for _, child := range children {
 		if child.Tag != "enc" {
 			continue
@@ -342,6 +343,7 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 		ag := child.AttrGetter()
 		encType, ok := ag.GetString("type", false)
 		if !ok {
+			allEncryptedChildrenSucceeded = false
 			continue
 		}
 		var decrypted []byte
@@ -380,14 +382,17 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 			}
 		} else {
 			cli.Log.Warnf("Unhandled encrypted message (type %s) from %s", encType, info.SourceString())
+			allEncryptedChildrenSucceeded = false
 			continue
 		}
 
 		if errors.Is(err, EventAlreadyProcessed) {
 			cli.Log.Debugf("Ignoring message %s from %s: %v", info.ID, info.SourceString(), err)
+			allEncryptedChildrenSucceeded = false
 			continue
 		} else if errors.Is(err, signalerror.ErrOldCounter) {
 			cli.Log.Warnf("Ignoring message %s from %s: %v", info.ID, info.SourceString(), err)
+			allEncryptedChildrenSucceeded = false
 			continue
 		} else if err != nil {
 			cli.Log.Warnf("Error decrypting message %s from %s: %v", info.ID, info.SourceString(), err)
@@ -400,11 +405,19 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 					cli.sendAck(ctx, node, NackMissingMessageSecret)
 				})
 			} else if cli.SynchronousAck {
-				cli.sendRetryReceipt(ctx, node, info, isUnavailable)
+				err = cli.sendRetryReceiptWithCount(ctx, node, info, isUnavailable, ag.OptionalInt("count"))
+				if err != nil {
+					cli.Log.Warnf("Failed to send retry receipt for message %s from %s: %v", info.ID, info.SourceString(), err)
+				}
 				// TODO this probably isn't supposed to ack
 				cli.sendAck(ctx, node, 0)
 			} else {
-				go cli.sendRetryReceipt(context.WithoutCancel(ctx), node, info, isUnavailable)
+				go func(failedEncCount int) {
+					err := cli.sendRetryReceiptWithCount(context.WithoutCancel(ctx), node, info, isUnavailable, failedEncCount)
+					if err != nil {
+						cli.Log.Warnf("Failed to send retry receipt for message %s from %s: %v", info.ID, info.SourceString(), err)
+					}
+				}(ag.OptionalInt("count"))
 				go cli.sendAck(ctx, node, 0)
 			}
 			cli.dispatchEvent(&events.UndecryptableMessage{
@@ -415,7 +428,6 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 			return
 		}
 		retryCount := ag.OptionalInt("count")
-		cli.cancelDelayedRequestFromPhone(info.ID)
 
 		var msg waE2E.Message
 		var handlerFailed bool
@@ -425,6 +437,7 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 			if err != nil {
 				cli.Log.Warnf("Error unmarshaling decrypted message from %s: %v", info.SourceString(), err)
 				protobufFailed = true
+				allEncryptedChildrenSucceeded = false
 				continue
 			}
 			protobufFailed = false
@@ -441,10 +454,18 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 							cli.sendAck(ctx, node, NackMissingMessageSecret)
 						})
 					} else if cli.SynchronousAck {
-						cli.sendRetryReceipt(ctx, node, info, false)
+						err = cli.sendRetryReceiptWithCount(ctx, node, info, false, retryCount)
+						if err != nil {
+							cli.Log.Warnf("Failed to send retry receipt for secret encrypted message %s from %s: %v", info.ID, info.SourceString(), err)
+						}
 						cli.sendAck(ctx, node, 0)
 					} else {
-						go cli.sendRetryReceipt(context.WithoutCancel(ctx), node, info, false)
+						go func(failedEncCount int) {
+							err := cli.sendRetryReceiptWithCount(context.WithoutCancel(ctx), node, info, false, failedEncCount)
+							if err != nil {
+								cli.Log.Warnf("Failed to send retry receipt for secret encrypted message %s from %s: %v", info.ID, info.SourceString(), err)
+							}
+						}(retryCount)
 						go cli.sendAck(ctx, node, 0)
 					}
 					cli.dispatchEvent(&events.UndecryptableMessage{
@@ -457,11 +478,20 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 			}
 			handlerFailed = cli.handleDecryptedMessage(ctx, info, msgToHandle, retryCount)
 		case 3:
-			handlerFailed, protobufFailed = cli.handleDecryptedArmadillo(ctx, info, decrypted, retryCount)
+			var childProtobufFailed bool
+			handlerFailed, childProtobufFailed = cli.handleDecryptedArmadillo(ctx, info, decrypted, retryCount)
+			protobufFailed = childProtobufFailed
+			if childProtobufFailed {
+				allEncryptedChildrenSucceeded = false
+			}
 		default:
 			cli.Log.Warnf("Unknown version %d in decrypted message from %s", ag.Int("v"), info.SourceString())
+			allEncryptedChildrenSucceeded = false
 		}
 		if handlerFailed {
+			if allEncryptedChildrenSucceeded {
+				cli.cancelDelayedRequestFromPhoneForMessage(info)
+			}
 			cli.Log.Warnf("Handler for %s failed", info.ID)
 			return
 		}
@@ -490,6 +520,9 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 				}()
 			}
 		}
+	}
+	if recognizedStanza && !protobufFailed && allEncryptedChildrenSucceeded {
+		cli.cancelDelayedRequestFromPhoneForMessage(info)
 	}
 	cli.backgroundIfAsyncAck(func() {
 		if !recognizedStanza {
