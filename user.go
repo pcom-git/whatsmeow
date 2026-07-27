@@ -965,17 +965,62 @@ func (cli *Client) GetBlocklist(ctx context.Context) (*types.Blocklist, error) {
 }
 
 // UpdateBlocklist updates the user's block list and returns the updated list.
-func (cli *Client) UpdateBlocklist(ctx context.Context, jid types.JID, action events.BlocklistChangeAction) (*types.Blocklist, error) {
+func (cli *Client) UpdateBlocklist(ctx context.Context, lidJID types.JID, action events.BlocklistChangeAction) (*types.Blocklist, error) {
+
+	lidJID = lidJID.ToNonAD()
+	if lidJID.User == "" || lidJID.Server != types.HiddenUserServer {
+		return nil, fmt.Errorf("invalid LID JID: %s", lidJID)
+	}
+	itemAttrs := waBinary.Attrs{
+		"jid":    lidJID,
+		"action": string(action),
+	}
+	switch action {
+	case events.BlocklistChangeActionBlock:
+		pnJID, err := cli.Store.LIDs.GetPNForLID(ctx, lidJID)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"failed to resolve PN for LID %s: %w",
+				lidJID,
+				err,
+			)
+		}
+
+		if pnJID.IsEmpty() {
+			return nil, fmt.Errorf(
+				"no PN mapping found for LID %s",
+				lidJID,
+			)
+		}
+
+		pnJID = pnJID.ToNonAD()
+		if pnJID.Server != types.DefaultUserServer {
+			return nil, fmt.Errorf(
+				"invalid PN JID %s resolved for LID %s",
+				pnJID,
+				lidJID,
+			)
+		}
+
+		// 只有拉黑需要 pn_jid。
+		itemAttrs["pn_jid"] = pnJID
+	case events.BlocklistChangeActionUnblock:
+		// 取消拉黑不能携带 pn_jid。
+
+	default:
+		return nil, fmt.Errorf(
+			"invalid blocklist action %q",
+			action,
+		)
+	}
+
 	resp, err := cli.sendIQ(ctx, infoQuery{
 		Namespace: "blocklist",
 		Type:      iqSet,
 		To:        types.ServerJID,
 		Content: []waBinary.Node{{
-			Tag: "item",
-			Attrs: waBinary.Attrs{
-				"jid":    jid,
-				"action": string(action),
-			},
+			Tag:   "item",
+			Attrs: itemAttrs,
 		}},
 	})
 	if err != nil {
@@ -985,5 +1030,5 @@ func (cli *Client) UpdateBlocklist(ctx context.Context, jid types.JID, action ev
 	if !ok {
 		return nil, &ElementMissingError{Tag: "list", In: "response to blocklist update"}
 	}
-	return cli.parseBlocklist(&list), err
+	return cli.parseBlocklist(&list), nil
 }
