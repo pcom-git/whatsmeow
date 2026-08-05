@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
 	"google.golang.org/protobuf/proto"
 
@@ -208,6 +209,100 @@ func (cli *Client) IsOnWhatsApp(ctx context.Context, phones []string) ([]types.I
 		output = append(output, info)
 	}
 	return output, nil
+}
+
+// GetLIDByUsername resolves a WhatsApp username to an LID using an interactive USync query.
+func (cli *Client) GetLIDByUsername(ctx context.Context, username string) (types.JID, error) {
+	if cli == nil {
+		return types.EmptyJID, ErrClientIsNil
+	}
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return types.EmptyJID, errors.New("username is empty")
+	}
+
+	resp, err := cli.sendIQ(ctx, infoQuery{
+		Namespace: "usync",
+		Type:      iqGet,
+		To:        types.ServerJID,
+		Timeout:   32 * time.Second,
+		Content: []waBinary.Node{
+			buildUsernameLIDUSyncNode(cli.generateRequestID(), username),
+		},
+	})
+	if err != nil {
+		return types.EmptyJID, fmt.Errorf("failed to query LID for username %q: %w", username, err)
+	}
+	return parseUsernameLIDUSyncResponse(resp, username)
+}
+
+func buildUsernameLIDUSyncNode(requestID, username string) waBinary.Node {
+	return waBinary.Node{
+		Tag: "usync",
+		Attrs: waBinary.Attrs{
+			"sid":     requestID,
+			"mode":    "query",
+			"last":    "true",
+			"index":   "0",
+			"context": "interactive",
+		},
+		Content: []waBinary.Node{
+			{
+				Tag: "query",
+				Content: []waBinary.Node{
+					{Tag: "contact", Attrs: waBinary.Attrs{"addressing_mode": string(types.AddressingModeLID)}},
+					{Tag: "lid"},
+					{Tag: "username"},
+				},
+			},
+			{
+				Tag: "list",
+				Content: []waBinary.Node{{
+					Tag: "user",
+					Content: []waBinary.Node{{
+						Tag:   "contact",
+						Attrs: waBinary.Attrs{"username": username},
+					}},
+				}},
+			},
+		},
+	}
+}
+
+func parseUsernameLIDUSyncResponse(resp *waBinary.Node, username string) (types.JID, error) {
+	if resp == nil {
+		return types.EmptyJID, &ElementMissingError{Tag: "list", In: "response to username LID usync query"}
+	}
+	list, ok := resp.GetOptionalChildByTag("usync", "list")
+	if !ok {
+		return types.EmptyJID, &ElementMissingError{Tag: "list", In: "response to username LID usync query"}
+	}
+
+	for _, user := range list.GetChildrenByTag("user") {
+		if contact, ok := user.GetOptionalChildByTag("contact"); ok {
+			contactType := contact.AttrGetter().OptionalString("type")
+			if contactType != "" && contactType != "in" {
+				continue
+			}
+		}
+
+		jid := user.AttrGetter().OptionalJIDOrEmpty("jid").ToNonAD()
+		lidNode := user.GetChildByTag("lid")
+		lid := lidNode.AttrGetter().OptionalJIDOrEmpty("val").ToNonAD()
+		jidIsLID := jid.Server == types.HiddenUserServer
+		lidIsLID := lid.Server == types.HiddenUserServer
+		if jidIsLID && lidIsLID && jid != lid {
+			return types.EmptyJID, fmt.Errorf("username %q returned mismatched LIDs %s and %s", username, jid, lid)
+		}
+		if jidIsLID {
+			return jid, nil
+		}
+		if lidIsLID {
+			return lid, nil
+		}
+	}
+
+	return types.EmptyJID, fmt.Errorf("username %q was not resolved to a LID", username)
 }
 
 // GetUserInfo gets basic user info (avatar, status, verified business name, device list).
