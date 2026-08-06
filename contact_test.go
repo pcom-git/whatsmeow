@@ -1,11 +1,42 @@
 package whatsmeow
 
 import (
+	"context"
+	"errors"
 	"testing"
 
 	waBinary "go.mau.fi/whatsmeow/binary"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 )
+
+type fakeAddContactLIDStore struct {
+	lid types.JID
+	pn  types.JID
+	err error
+}
+
+func (f *fakeAddContactLIDStore) PutManyLIDMappings(context.Context, []store.LIDMapping) error {
+	return nil
+}
+
+func (f *fakeAddContactLIDStore) PutLIDMapping(_ context.Context, lid, pn types.JID) error {
+	f.lid = lid
+	f.pn = pn
+	return f.err
+}
+
+func (f *fakeAddContactLIDStore) GetPNForLID(context.Context, types.JID) (types.JID, error) {
+	return types.EmptyJID, nil
+}
+
+func (f *fakeAddContactLIDStore) GetLIDForPN(context.Context, types.JID) (types.JID, error) {
+	return types.EmptyJID, nil
+}
+
+func (f *fakeAddContactLIDStore) GetManyLIDsForPNs(context.Context, []types.JID) (map[types.JID]types.JID, error) {
+	return nil, nil
+}
 
 func TestParsePhoneContactQueryResponse(t *testing.T) {
 	list := waBinary.Node{
@@ -136,5 +167,51 @@ func TestParseUsernameContactDeltaResponseRequiresActiveUsername(t *testing.T) {
 
 	if err := parseUsernameContactDeltaResponse(&list, &result, "loveinrush", types.NewJID("47210397962342", types.HiddenUserServer)); err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestCacheAddContactLIDMappingStoresResolvedPhoneAndLID(t *testing.T) {
+	lidStore := &fakeAddContactLIDStore{}
+	cli := &Client{Store: &store.Device{LIDs: lidStore}}
+	identity := addContactIdentity{
+		PhoneJID: types.NewJID("15167072015", types.DefaultUserServer),
+		LIDJID:   types.NewJID("101395722203279", types.HiddenUserServer),
+	}
+
+	if err := cli.cacheAddContactLIDMapping(context.Background(), identity); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if lidStore.lid != identity.LIDJID || lidStore.pn != identity.PhoneJID {
+		t.Fatalf("unexpected cached mapping: lid=%s pn=%s", lidStore.lid, lidStore.pn)
+	}
+}
+
+func TestCacheAddContactLIDMappingSkipsUsernameOnlyContact(t *testing.T) {
+	lidStore := &fakeAddContactLIDStore{}
+	cli := &Client{Store: &store.Device{LIDs: lidStore}}
+	identity := addContactIdentity{
+		LIDJID: types.NewJID("101395722203279", types.HiddenUserServer),
+	}
+
+	if err := cli.cacheAddContactLIDMapping(context.Background(), identity); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !lidStore.lid.IsEmpty() || !lidStore.pn.IsEmpty() {
+		t.Fatalf("expected no cached mapping, got lid=%s pn=%s", lidStore.lid, lidStore.pn)
+	}
+}
+
+func TestCacheAddContactLIDMappingReturnsStoreError(t *testing.T) {
+	expectedErr := errors.New("store failed")
+	lidStore := &fakeAddContactLIDStore{err: expectedErr}
+	cli := &Client{Store: &store.Device{LIDs: lidStore}}
+	identity := addContactIdentity{
+		PhoneJID: types.NewJID("15167072015", types.DefaultUserServer),
+		LIDJID:   types.NewJID("101395722203279", types.HiddenUserServer),
+	}
+
+	err := cli.cacheAddContactLIDMapping(context.Background(), identity)
+	if !errors.Is(err, expectedErr) {
+		t.Fatalf("expected store error, got %v", err)
 	}
 }

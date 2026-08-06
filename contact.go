@@ -117,6 +117,9 @@ func (cli *Client) AddContact(ctx context.Context, params AddContactParams) (*Ad
 	if err := cli.SendAppState(ctx, patch); err != nil {
 		return nil, fmt.Errorf("failed to send add contact app state patch: %w", err)
 	}
+	if err := cli.cacheAddContactLIDMapping(ctx, identity); err != nil {
+		return nil, err
+	}
 	cli.Log.Debugf("Subscribing to added contact presence: lid_jid=%s", identity.LIDJID)
 	if err := cli.SubscribePresence(ctx, identity.LIDJID); err != nil {
 		cli.Log.Warnf("Failed to subscribe to added contact presence %s: %v", identity.LIDJID, err)
@@ -130,6 +133,19 @@ func (cli *Client) AddContact(ctx context.Context, params AddContactParams) (*Ad
 		FullName:                 fullName,
 		SaveOnPrimaryAddressbook: params.SaveOnPrimaryAddressbook,
 	}, nil
+}
+
+func (cli *Client) cacheAddContactLIDMapping(ctx context.Context, identity addContactIdentity) error {
+	if identity.PhoneJID.IsEmpty() || identity.LIDJID.IsEmpty() || cli.Store == nil || cli.Store.LIDs == nil {
+		return nil
+	}
+	if cli.Log != nil {
+		cli.Log.Debugf("Caching added contact LID mapping: lid_jid=%s phone_jid=%s", identity.LIDJID, identity.PhoneJID)
+	}
+	if err := cli.Store.LIDs.PutLIDMapping(ctx, identity.LIDJID, identity.PhoneJID); err != nil {
+		return fmt.Errorf("failed to cache added contact LID mapping %s -> %s: %w", identity.LIDJID, identity.PhoneJID, err)
+	}
+	return nil
 }
 
 func normalizeAddContactPhone(phone string) string {
