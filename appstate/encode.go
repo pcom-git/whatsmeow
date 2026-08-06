@@ -37,6 +37,59 @@ type PatchInfo struct {
 	Mutations []MutationInfo
 }
 
+// ContactInfo contains the data needed to add or update a WhatsApp contact.
+type ContactInfo struct {
+	PhoneJID                 types.JID
+	LIDJID                   types.JID
+	Username                 string
+	FirstName                string
+	FullName                 string
+	SaveOnPrimaryAddressbook bool
+}
+
+// BuildContact builds an app state patch for adding or updating a contact.
+func BuildContact(info ContactInfo) PatchInfo {
+	indexJID := info.PhoneJID
+	if indexJID.IsEmpty() {
+		indexJID = info.LIDJID
+	}
+	value := &waSyncAction.SyncActionValue{}
+	if info.PhoneJID.IsEmpty() {
+		action := &waSyncAction.LidContactAction{
+			FullName:  proto.String(info.FullName),
+			FirstName: proto.String(info.FirstName),
+		}
+		if info.Username != "" {
+			action.Username = proto.String(info.Username)
+		}
+		value.LidContactAction = action
+	} else {
+		action := &waSyncAction.ContactAction{
+			FullName:                 proto.String(info.FullName),
+			FirstName:                proto.String(info.FirstName),
+			LidJID:                   proto.String(info.LIDJID.String()),
+			SaveOnPrimaryAddressbook: proto.Bool(info.SaveOnPrimaryAddressbook),
+			PnJID:                    proto.String(info.PhoneJID.String()),
+		}
+		if info.Username != "" {
+			action.Username = proto.String(info.Username)
+		}
+		value.ContactAction = action
+	}
+	indexType := IndexContact
+	if info.PhoneJID.IsEmpty() {
+		indexType = IndexLIDContact
+	}
+	return PatchInfo{
+		Type: WAPatchCriticalUnblockLow,
+		Mutations: []MutationInfo{{
+			Index:   []string{indexType, indexJID.String()},
+			Version: 2,
+			Value:   value,
+		}},
+	}
+}
+
 // BuildMute builds an app state patch for muting or unmuting a chat.
 //
 // If mute is true and the mute duration is zero, the chat is muted forever.

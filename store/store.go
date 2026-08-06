@@ -81,13 +81,14 @@ type AppStateStore interface {
 }
 
 type ContactEntry struct {
-	JID       types.JID
-	FirstName string
-	FullName  string
+	JID          types.JID
+	FirstName    string
+	FullName     string
+	IsAddContact bool
 }
 
-func (ce ContactEntry) GetMassInsertValues() [3]any {
-	return [...]any{ce.JID.String(), ce.FirstName, ce.FullName}
+func (ce ContactEntry) GetMassInsertValues() [4]any {
+	return [...]any{ce.JID.String(), ce.FirstName, ce.FullName, ce.IsAddContact}
 }
 
 type RedactedPhoneEntry struct {
@@ -122,7 +123,7 @@ type ContactListPage struct {
 type ContactStore interface {
 	PutPushName(ctx context.Context, user types.JID, pushName string) (bool, string, error)
 	PutBusinessName(ctx context.Context, user types.JID, businessName string) (bool, string, error)
-	PutContactName(ctx context.Context, user types.JID, fullName, firstName string) error
+	PutContactName(ctx context.Context, user types.JID, firstName, fullName string, isAddContact bool) error
 	PutAllContactNames(ctx context.Context, contacts []ContactEntry) error
 	PutManyRedactedPhones(ctx context.Context, entries []RedactedPhoneEntry) error
 	GetContact(ctx context.Context, user types.JID) (types.ContactInfo, error)

@@ -17,11 +17,13 @@ import (
 	"go.mau.fi/util/exslices"
 	"go.mau.fi/util/ptr"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 
 	"go.mau.fi/whatsmeow/appstate"
 	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/proto/waServerSync"
+	"go.mau.fi/whatsmeow/proto/waSyncAction"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -95,7 +97,7 @@ func (cli *Client) fetchAppState(ctx context.Context, name appstate.WAPatchName,
 	}
 	return eventsToDispatch, nil
 }
- 
+
 func (cli *Client) handleAppStateRecovery(
 	ctx context.Context,
 	reqID types.MessageID,
@@ -206,9 +208,19 @@ func (cli *Client) filterContacts(mutations []appstate.Mutation) ([]appstate.Mut
 			jid, _ := types.ParseJID(mutation.Index[1])
 			act := mutation.Action.GetContactAction()
 			contacts = append(contacts, store.ContactEntry{
-				JID:       jid,
-				FirstName: act.GetFirstName(),
-				FullName:  act.GetFullName(),
+				JID:          jid,
+				FirstName:    act.GetFirstName(),
+				FullName:     act.GetFullName(),
+				IsAddContact: true,
+			})
+		} else if mutation.Index[0] == "lid_contact" && len(mutation.Index) > 1 {
+			jid, _ := types.ParseJID(mutation.Index[1])
+			act := mutation.Action.GetLidContactAction()
+			contacts = append(contacts, store.ContactEntry{
+				JID:          jid,
+				FirstName:    act.GetFirstName(),
+				FullName:     act.GetFullName(),
+				IsAddContact: true,
 			})
 		} else {
 			filteredMutations = append(filteredMutations, mutation)
@@ -291,7 +303,19 @@ func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchNa
 		act := mutation.Action.GetContactAction()
 		eventToDispatch = &events.Contact{JID: jid, Timestamp: ts, Action: act, FromFullSync: fullSync}
 		if cli.Store.Contacts != nil {
-			storeUpdateError = cli.Store.Contacts.PutContactName(ctx, jid, act.GetFirstName(), act.GetFullName())
+			storeUpdateError = cli.Store.Contacts.PutContactName(ctx, jid, act.GetFirstName(), act.GetFullName(), true)
+		}
+	case appstate.IndexLIDContact:
+		act := mutation.Action.GetLidContactAction()
+		contactAction := &waSyncAction.ContactAction{
+			FullName:  proto.String(act.GetFullName()),
+			FirstName: proto.String(act.GetFirstName()),
+			LidJID:    proto.String(jid.String()),
+			Username:  proto.String(act.GetUsername()),
+		}
+		eventToDispatch = &events.Contact{JID: jid, Timestamp: ts, Action: contactAction, FromFullSync: fullSync}
+		if cli.Store.Contacts != nil {
+			storeUpdateError = cli.Store.Contacts.PutContactName(ctx, jid, act.GetFirstName(), act.GetFullName(), true)
 		}
 	case appstate.IndexClearChat:
 		act := mutation.Action.GetClearChatAction()

@@ -652,8 +652,8 @@ func (s *SQLStore) GetAppStateMutationMAC(ctx context.Context, name string, inde
 
 const (
 	putContactNameQuery = `
-		INSERT INTO whatsmeow_contacts (our_jid, their_jid, first_name, full_name) VALUES ($1, $2, $3, $4)
-		ON CONFLICT (our_jid, their_jid) DO UPDATE SET first_name=excluded.first_name, full_name=excluded.full_name
+		INSERT INTO whatsmeow_contacts (our_jid, their_jid, first_name, full_name, is_add_contact) VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (our_jid, their_jid) DO UPDATE SET first_name=excluded.first_name, full_name=excluded.full_name, is_add_contact=excluded.is_add_contact
 	`
 	putRedactedPhoneQuery = `
 		INSERT INTO whatsmeow_contacts (our_jid, their_jid, redacted_phone)
@@ -669,16 +669,16 @@ const (
 		ON CONFLICT (our_jid, their_jid) DO UPDATE SET business_name=excluded.business_name
 	`
 	getContactQuery = `
-		SELECT first_name, full_name, push_name, business_name, redacted_phone FROM whatsmeow_contacts WHERE our_jid=$1 AND their_jid=$2
+		SELECT first_name, full_name, push_name, business_name, redacted_phone, is_add_contact FROM whatsmeow_contacts WHERE our_jid=$1 AND their_jid=$2
 	`
 	getAllContactsQuery = `
-		SELECT their_jid, first_name, full_name, push_name, business_name, redacted_phone FROM whatsmeow_contacts WHERE our_jid=$1
+		SELECT their_jid, first_name, full_name, push_name, business_name, redacted_phone, is_add_contact FROM whatsmeow_contacts WHERE our_jid=$1
 	`
 	getContactListPageCountQuery = `
 		SELECT COUNT(*)
 		FROM whatsmeow_contacts
 		WHERE our_jid = $1
-		  AND TRIM(COALESCE(full_name, '')) <> ''
+		  AND is_add_contact=true
 	`
 	getContactListPageQuery = `
 		SELECT
@@ -688,20 +688,21 @@ const (
 			c.push_name,
 			c.business_name,
 			c.redacted_phone,
+			c.is_add_contact,
 			lm.lid
 		FROM whatsmeow_contacts c
 		LEFT JOIN whatsmeow_lid_map lm
 		  ON c.their_jid LIKE '%@s.whatsapp.net'
 		 AND replace(c.their_jid, '@s.whatsapp.net', '') = lm.pn
 		WHERE c.our_jid = $1
-		  AND TRIM(COALESCE(c.full_name, '')) <> ''
+		  AND c.is_add_contact=true
 		ORDER BY c.their_jid ASC
 		LIMIT $2 OFFSET $3
 	`
 )
 
 var putContactNamesMassInsertBuilder = dbutil.NewMassInsertBuilder[store.ContactEntry, [1]any](
-	putContactNameQuery, "($1, $%d, $%d, $%d)",
+	putContactNameQuery, "($1, $%d, $%d, $%d, $%d)",
 )
 
 var putRedactedPhonesMassInsertBuilder = dbutil.NewMassInsertBuilder[store.RedactedPhoneEntry, [1]any](
@@ -750,7 +751,7 @@ func (s *SQLStore) PutBusinessName(ctx context.Context, user types.JID, business
 	return false, "", nil
 }
 
-func (s *SQLStore) PutContactName(ctx context.Context, user types.JID, firstName, fullName string) error {
+func (s *SQLStore) PutContactName(ctx context.Context, user types.JID, firstName, fullName string, isAddContact bool) error {
 	s.contactCacheLock.Lock()
 	defer s.contactCacheLock.Unlock()
 
@@ -758,13 +759,14 @@ func (s *SQLStore) PutContactName(ctx context.Context, user types.JID, firstName
 	if err != nil {
 		return err
 	}
-	if cached.FirstName != firstName || cached.FullName != fullName {
-		_, err = s.db.Exec(ctx, putContactNameQuery, s.JID, user, firstName, fullName)
+	if cached.FirstName != firstName || cached.FullName != fullName || cached.IsAddContact != isAddContact {
+		_, err = s.db.Exec(ctx, putContactNameQuery, s.JID, user, firstName, fullName, isAddContact)
 		if err != nil {
 			return err
 		}
 		cached.FirstName = firstName
 		cached.FullName = fullName
+		cached.IsAddContact = isAddContact
 		cached.Found = true
 	}
 	return nil
@@ -845,7 +847,8 @@ func (s *SQLStore) getContact(ctx context.Context, user types.JID) (*types.Conta
 	}
 
 	var first, full, push, business, redactedPhone sql.NullString
-	err := s.db.QueryRow(ctx, getContactQuery, s.JID, user).Scan(&first, &full, &push, &business, &redactedPhone)
+	var isAddContact bool
+	err := s.db.QueryRow(ctx, getContactQuery, s.JID, user).Scan(&first, &full, &push, &business, &redactedPhone, &isAddContact)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
 	}
@@ -855,6 +858,7 @@ func (s *SQLStore) getContact(ctx context.Context, user types.JID) (*types.Conta
 		FullName:      full.String,
 		PushName:      push.String,
 		BusinessName:  business.String,
+		IsAddContact:  isAddContact,
 		RedactedPhone: redactedPhone.String,
 	}
 	s.contactCache[user] = info
@@ -879,7 +883,8 @@ type contactTuple struct {
 var convertContactRow = dbutil.ConvertRowFn[*contactTuple](func(rows dbutil.Scannable) (*contactTuple, error) {
 	var jid types.JID
 	var first, full, push, business, redactedPhone sql.NullString
-	err := rows.Scan(&jid, &first, &full, &push, &business, &redactedPhone)
+	var isAddContact bool
+	err := rows.Scan(&jid, &first, &full, &push, &business, &redactedPhone, &isAddContact)
 	if err != nil {
 		return nil, fmt.Errorf("error scanning row: %w", err)
 	}
@@ -891,6 +896,7 @@ var convertContactRow = dbutil.ConvertRowFn[*contactTuple](func(rows dbutil.Scan
 			FullName:      full.String,
 			PushName:      push.String,
 			BusinessName:  business.String,
+			IsAddContact:  isAddContact,
 			RedactedPhone: redactedPhone.String,
 		},
 	}, nil
@@ -947,7 +953,8 @@ func (s *SQLStore) GetContactListPage(ctx context.Context, options store.Contact
 	for rows.Next() {
 		var jid types.JID
 		var first, full, push, business, redactedPhone, lidUser sql.NullString
-		err = rows.Scan(&jid, &first, &full, &push, &business, &redactedPhone, &lidUser)
+		var isAddContact bool
+		err = rows.Scan(&jid, &first, &full, &push, &business, &redactedPhone, &isAddContact, &lidUser)
 		if err != nil {
 			return page, fmt.Errorf("error scanning row: %w", err)
 		}
@@ -968,6 +975,7 @@ func (s *SQLStore) GetContactListPage(ctx context.Context, options store.Contact
 				FullName:      full.String,
 				PushName:      push.String,
 				BusinessName:  business.String,
+				IsAddContact:  isAddContact,
 				RedactedPhone: redactedPhone.String,
 			},
 		})
