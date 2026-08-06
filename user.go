@@ -305,6 +305,99 @@ func parseUsernameLIDUSyncResponse(resp *waBinary.Node, username string) (types.
 	return types.EmptyJID, fmt.Errorf("username %q was not resolved to a LID", username)
 }
 
+// GetUsernameByLID resolves a WhatsApp LID to its username using an interactive USync query.
+func (cli *Client) GetUsernameByLID(ctx context.Context, lid types.JID) (string, error) {
+	if cli == nil {
+		return "", ErrClientIsNil
+	}
+	lid = lid.ToNonAD()
+	if lid.IsEmpty() || lid.User == "" || lid.Server != types.HiddenUserServer {
+		return "", fmt.Errorf("invalid LID %s", lid)
+	}
+
+	resp, err := cli.sendIQ(ctx, infoQuery{
+		Namespace: "usync",
+		Type:      iqGet,
+		To:        types.ServerJID,
+		Timeout:   32 * time.Second,
+		Content: []waBinary.Node{
+			buildLIDUsernameUSyncNode(cli.generateRequestID(), lid),
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to query username for LID %s: %w", lid, err)
+	}
+	return parseLIDUsernameUSyncResponse(resp, lid)
+}
+
+func buildLIDUsernameUSyncNode(requestID string, lid types.JID) waBinary.Node {
+	return waBinary.Node{
+		Tag: "usync",
+		Attrs: waBinary.Attrs{
+			"sid":     requestID,
+			"mode":    "query",
+			"last":    "true",
+			"index":   "0",
+			"context": "interactive",
+		},
+		Content: []waBinary.Node{
+			{
+				Tag: "query",
+				Content: []waBinary.Node{
+					{Tag: "contact"},
+					{Tag: "username"},
+				},
+			},
+			{
+				Tag: "list",
+				Content: []waBinary.Node{{
+					Tag:   "user",
+					Attrs: waBinary.Attrs{"jid": lid},
+				}},
+			},
+		},
+	}
+}
+
+func parseLIDUsernameUSyncResponse(resp *waBinary.Node, lid types.JID) (string, error) {
+	if resp == nil {
+		return "", &ElementMissingError{Tag: "list", In: "response to LID username usync query"}
+	}
+	list, ok := resp.GetOptionalChildByTag("usync", "list")
+	if !ok {
+		return "", &ElementMissingError{Tag: "list", In: "response to LID username usync query"}
+	}
+
+	for _, user := range list.GetChildrenByTag("user") {
+		responseJID, ok := user.Attrs["jid"].(types.JID)
+		if !ok || responseJID.ToNonAD() != lid {
+			continue
+		}
+
+		if usernameNode, ok := user.GetOptionalChildByTag("username"); ok {
+			var username string
+			switch content := usernameNode.Content.(type) {
+			case []byte:
+				username = string(content)
+			case string:
+				username = content
+			}
+			if username = strings.TrimSpace(username); username != "" {
+				return username, nil
+			}
+		}
+
+		if contact, ok := user.GetOptionalChildByTag("contact"); ok {
+			username := strings.TrimSpace(contact.AttrGetter().OptionalString("username"))
+			if username != "" {
+				return username, nil
+			}
+		}
+	}
+
+	return "", fmt.Errorf("LID %s was not resolved to a username", lid)
+}
+
 // GetUserInfo gets basic user info (avatar, status, verified business name, device list).
 func (cli *Client) GetUserInfo(ctx context.Context, jids []types.JID) (map[types.JID]types.UserInfo, error) {
 	list, err := cli.usync(ctx, jids, "full", "background", []waBinary.Node{
