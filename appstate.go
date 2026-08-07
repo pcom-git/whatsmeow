@@ -180,12 +180,19 @@ func (cli *Client) collectEventsToDispatch(
 ) error {
 	if name == appstate.WAPatchCriticalUnblockLow && fullSync && !cli.EmitAppStateEventsOnFullSync {
 		var contacts []store.ContactEntry
-		mutations, contacts = cli.filterContacts(mutations)
+		var lidMappings []store.LIDMapping
+		mutations, contacts, lidMappings = cli.filterContacts(mutations)
 		cli.Log.Debugf("Mass inserting app state snapshot with %d contacts into the store", len(contacts))
 		err := cli.Store.Contacts.PutAllContactNames(ctx, contacts)
 		if err != nil {
 			// This is a fairly serious failure, so just abort the whole thing
 			return fmt.Errorf("failed to update contact store with data from snapshot: %v", err)
+		}
+		if len(lidMappings) > 0 && cli.Store.LIDs != nil {
+			err = cli.Store.LIDs.PutManyLIDMappings(ctx, lidMappings)
+			if err != nil {
+				return fmt.Errorf("failed to update LID mapping store with data from snapshot: %v", err)
+			}
 		}
 	}
 	for _, mutation := range mutations {
@@ -200,9 +207,34 @@ func (cli *Client) collectEventsToDispatch(
 	return nil
 }
 
-func (cli *Client) filterContacts(mutations []appstate.Mutation) ([]appstate.Mutation, []store.ContactEntry) {
+func contactActionLIDMapping(indexJID types.JID, act *waSyncAction.ContactAction) (store.LIDMapping, bool) {
+	if act == nil {
+		return store.LIDMapping{}, false
+	}
+	pn := indexJID
+	if rawPN := act.GetPnJID(); rawPN != "" {
+		parsedPN, err := types.ParseJID(rawPN)
+		if err != nil {
+			return store.LIDMapping{}, false
+		}
+		pn = parsedPN
+	}
+	lid, err := types.ParseJID(act.GetLidJID())
+	if err != nil || lid.IsEmpty() || pn.IsEmpty() {
+		return store.LIDMapping{}, false
+	}
+	lid = lid.ToNonAD()
+	pn = pn.ToNonAD()
+	if lid.Server != types.HiddenUserServer || pn.Server != types.DefaultUserServer {
+		return store.LIDMapping{}, false
+	}
+	return store.LIDMapping{LID: lid, PN: pn}, true
+}
+
+func (cli *Client) filterContacts(mutations []appstate.Mutation) ([]appstate.Mutation, []store.ContactEntry, []store.LIDMapping) {
 	filteredMutations := mutations[:0]
 	contacts := make([]store.ContactEntry, 0, len(mutations))
+	lidMappings := make([]store.LIDMapping, 0, len(mutations))
 	for _, mutation := range mutations {
 		if mutation.Index[0] == "contact" && len(mutation.Index) > 1 {
 			jid, _ := types.ParseJID(mutation.Index[1])
@@ -213,6 +245,9 @@ func (cli *Client) filterContacts(mutations []appstate.Mutation) ([]appstate.Mut
 				FullName:     act.GetFullName(),
 				IsAddContact: true,
 			})
+			if mapping, ok := contactActionLIDMapping(jid, act); ok {
+				lidMappings = append(lidMappings, mapping)
+			}
 		} else if mutation.Index[0] == "lid_contact" && len(mutation.Index) > 1 {
 			jid, _ := types.ParseJID(mutation.Index[1])
 			act := mutation.Action.GetLidContactAction()
@@ -226,7 +261,7 @@ func (cli *Client) filterContacts(mutations []appstate.Mutation) ([]appstate.Mut
 			filteredMutations = append(filteredMutations, mutation)
 		}
 	}
-	return filteredMutations, contacts
+	return filteredMutations, contacts, lidMappings
 }
 
 func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchName, mutation appstate.Mutation, fullSync bool) (eventToDispatch any) {
@@ -304,6 +339,14 @@ func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchNa
 		eventToDispatch = &events.Contact{JID: jid, Timestamp: ts, Action: act, FromFullSync: fullSync}
 		if cli.Store.Contacts != nil {
 			storeUpdateError = cli.Store.Contacts.PutContactName(ctx, jid, act.GetFirstName(), act.GetFullName(), true)
+		}
+		if cli.Store.LIDs != nil {
+			if mapping, ok := contactActionLIDMapping(jid, act); ok {
+				err := cli.Store.LIDs.PutLIDMapping(ctx, mapping.LID, mapping.PN)
+				if err != nil {
+					cli.Log.Warnf("Failed to store LID mapping from contact app state mutation: %v", err)
+				}
+			}
 		}
 	case appstate.IndexLIDContact:
 		act := mutation.Action.GetLidContactAction()

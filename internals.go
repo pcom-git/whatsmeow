@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 
 	"go.mau.fi/libsignal/keys/prekey"
@@ -27,6 +28,7 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	"go.mau.fi/whatsmeow/util/keys"
+	waKeys "go.mau.fi/whatsmeow/util/keys"
 )
 
 type DangerousInternalClient struct {
@@ -59,7 +61,7 @@ func (int *DangerousInternalClient) CollectEventsToDispatch(ctx context.Context,
 	return int.c.collectEventsToDispatch(ctx, name, mutations, fullSync, eventsToDispatch)
 }
 
-func (int *DangerousInternalClient) FilterContacts(mutations []appstate.Mutation) ([]appstate.Mutation, []store.ContactEntry) {
+func (int *DangerousInternalClient) FilterContacts(mutations []appstate.Mutation) ([]appstate.Mutation, []store.ContactEntry, []store.LIDMapping) {
 	return int.c.filterContacts(mutations)
 }
 
@@ -85,6 +87,10 @@ func (int *DangerousInternalClient) RequestAppStateKeys(ctx context.Context, raw
 
 func (int *DangerousInternalClient) SendAppState(ctx context.Context, patch appstate.PatchInfo, allowRetry bool) error {
 	return int.c.sendAppState(ctx, patch, allowRetry)
+}
+
+func (int *DangerousInternalClient) SendChatNoteAppState(ctx context.Context, patch appstate.PatchInfo, allowRetry bool) error {
+	return int.c.sendChatNoteAppState(ctx, patch, allowRetry)
 }
 
 func (int *DangerousInternalClient) HandleDecryptedArmadillo(ctx context.Context, info *types.MessageInfo, decrypted []byte, retryCount int) (handlerFailed, protobufFailed bool) {
@@ -415,6 +421,26 @@ func (int *DangerousInternalClient) DecryptBotMessage(ctx context.Context, messa
 	return int.c.decryptBotMessage(ctx, messageSecret, msMsg, messageID, targetSenderJID, info)
 }
 
+func (int *DangerousInternalClient) MaybeDecryptSecretEncryptedMessage(ctx context.Context, info *types.MessageInfo, msg *waE2E.Message) (*waE2E.Message, bool, error) {
+	return int.c.maybeDecryptSecretEncryptedMessage(ctx, info, msg)
+}
+
+func (int *DangerousInternalClient) DecryptMessageEditSecretEncryptedMessage(ctx context.Context, info *types.MessageInfo, msg *waE2E.Message) (*waE2E.Message, error) {
+	return int.c.decryptMessageEditSecretEncryptedMessage(ctx, info, msg)
+}
+
+func (int *DangerousInternalClient) DecryptMessageEditSecret(ctx context.Context, info *types.MessageInfo, encMessage messageEncryptedSecret, targetKey *waCommon.MessageKey) ([]byte, error) {
+	return int.c.decryptMessageEditSecret(ctx, info, encMessage, targetKey)
+}
+
+func (int *DangerousInternalClient) MessageEditJIDCandidates(info *types.MessageInfo, targetKey *waCommon.MessageKey) []types.JID {
+	return int.c.messageEditJIDCandidates(info, targetKey)
+}
+
+func (int *DangerousInternalClient) NormalizeMessageSecretSender(ctx context.Context, sender types.JID) types.JID {
+	return int.c.normalizeMessageSecretSender(ctx, sender)
+}
+
 func (int *DangerousInternalClient) SendMexIQ(ctx context.Context, queryID string, variables any) (json.RawMessage, error) {
 	return int.c.sendMexIQ(ctx, queryID, variables)
 }
@@ -433,6 +459,10 @@ func (int *DangerousInternalClient) HandleAppStateNotification(ctx context.Conte
 
 func (int *DangerousInternalClient) HandlePictureNotification(ctx context.Context, node *waBinary.Node) {
 	int.c.handlePictureNotification(ctx, node)
+}
+
+func (int *DangerousInternalClient) HandleContactsNotification(ctx context.Context, node *waBinary.Node) {
+	int.c.handleContactsNotification(ctx, node)
 }
 
 func (int *DangerousInternalClient) HandleDeviceNotification(ctx context.Context, node *waBinary.Node) {
@@ -655,12 +685,28 @@ func (int *DangerousInternalClient) ShouldRecreateSession(ctx context.Context, r
 	return int.c.shouldRecreateSession(ctx, retryCount, jid)
 }
 
+func (int *DangerousInternalClient) RetryLock(chat, sender types.JID, messageID types.MessageID) *sync.Mutex {
+	return int.c.retryLock(chat, sender, messageID)
+}
+
 func (int *DangerousInternalClient) TryHandleRetryReceipt(ctx context.Context, receipt *events.Receipt, node *waBinary.Node) {
 	int.c.tryHandleRetryReceipt(ctx, receipt, node)
 }
 
+func (int *DangerousInternalClient) ReconcileRetryRegistration(ctx context.Context, jid types.JID, registrationID uint32) (hasSession, changed bool, err error) {
+	return int.c.reconcileRetryRegistration(ctx, jid, registrationID)
+}
+
+func (int *DangerousInternalClient) SendRetryFrame(ctx context.Context, node waBinary.Node) error {
+	return int.c.sendRetryFrame(ctx, node)
+}
+
 func (int *DangerousInternalClient) HandleRetryReceipt(ctx context.Context, receipt *events.Receipt, node *waBinary.Node) error {
 	return int.c.handleRetryReceipt(ctx, receipt, node)
+}
+
+func (int *DangerousInternalClient) CancelDelayedRequestFromPhoneForMessage(info *types.MessageInfo) {
+	int.c.cancelDelayedRequestFromPhoneForMessage(info)
 }
 
 func (int *DangerousInternalClient) CancelDelayedRequestFromPhone(msgID types.MessageID) {
@@ -671,6 +717,26 @@ func (int *DangerousInternalClient) DelayedRequestMessageFromPhone(info *types.M
 	int.c.delayedRequestMessageFromPhone(info)
 }
 
+func (int *DangerousInternalClient) ReservePhoneRerequest(info *types.MessageInfo, retryCount int, cancel context.CancelFunc, done <-chan struct{}) (context.CancelFunc, bool) {
+	return int.c.reservePhoneRerequest(info, retryCount, cancel, done)
+}
+
+func (int *DangerousInternalClient) FinishPhoneRerequest(info *types.MessageInfo, retryCount int, done <-chan struct{}) {
+	int.c.finishPhoneRerequest(info, retryCount, done)
+}
+
+func (int *DangerousInternalClient) PreparePhoneRerequest(info *types.MessageInfo, retryCount int) (context.Context, context.CancelFunc, bool) {
+	return int.c.preparePhoneRerequest(info, retryCount)
+}
+
+func (int *DangerousInternalClient) WaitForPhoneRerequest(ctx context.Context, cancel context.CancelFunc, info *types.MessageInfo, retryCount int) {
+	int.c.waitForPhoneRerequest(ctx, cancel, info, retryCount)
+}
+
+func (int *DangerousInternalClient) SchedulePhoneRerequest(ctx context.Context, info *types.MessageInfo, retryCount int) {
+	int.c.schedulePhoneRerequest(ctx, info, retryCount)
+}
+
 func (int *DangerousInternalClient) ImmediateRequestMessageFromPhone(ctx context.Context, info *types.MessageInfo) {
 	int.c.immediateRequestMessageFromPhone(ctx, info)
 }
@@ -679,8 +745,28 @@ func (int *DangerousInternalClient) ClearDelayedMessageRequests() {
 	int.c.clearDelayedMessageRequests()
 }
 
+func (int *DangerousInternalClient) GenerateRetryPreKey(ctx context.Context) (*waKeys.PreKey, error) {
+	return int.c.generateRetryPreKey(ctx)
+}
+
 func (int *DangerousInternalClient) SendRetryReceipt(ctx context.Context, node *waBinary.Node, info *types.MessageInfo, forceIncludeIdentity bool) {
 	int.c.sendRetryReceipt(ctx, node, info, forceIncludeIdentity)
+}
+
+func (int *DangerousInternalClient) SendRetryReceiptWithCount(ctx context.Context, node *waBinary.Node, info *types.MessageInfo, forceIncludeIdentity bool, failedEncCount int) error {
+	return int.c.sendRetryReceiptWithCount(ctx, node, info, forceIncludeIdentity, failedEncCount)
+}
+
+func (int *DangerousInternalClient) MaybeEncryptMessageEdit(ctx context.Context, ownID, chat types.JID, message *waE2E.Message) (*waE2E.Message, error) {
+	return int.c.maybeEncryptMessageEdit(ctx, ownID, chat, message)
+}
+
+func (int *DangerousInternalClient) BuildCaptionEditFromOriginal(ctx context.Context, chat types.JID, id types.MessageID, caption string, contextInfo *waE2E.ContextInfo) (*waE2E.Message, bool) {
+	return int.c.buildCaptionEditFromOriginal(ctx, chat, id, caption, contextInfo)
+}
+
+func (int *DangerousInternalClient) GetOriginalMessageForEdit(ctx context.Context, chat types.JID, id types.MessageID) *waE2E.Message {
+	return int.c.getOriginalMessageForEdit(ctx, chat, id)
 }
 
 func (int *DangerousInternalClient) SendNewsletter(ctx context.Context, to types.JID, id types.MessageID, message *waE2E.Message, mediaID string, timings *MessageDebugTimings) ([]byte, error) {

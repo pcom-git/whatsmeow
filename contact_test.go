@@ -5,18 +5,26 @@ import (
 	"errors"
 	"testing"
 
+	"google.golang.org/protobuf/proto"
+
+	"go.mau.fi/whatsmeow/appstate"
 	waBinary "go.mau.fi/whatsmeow/binary"
+	"go.mau.fi/whatsmeow/proto/waServerSync"
+	"go.mau.fi/whatsmeow/proto/waSyncAction"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
+	waLog "go.mau.fi/whatsmeow/util/log"
 )
 
 type fakeAddContactLIDStore struct {
-	lid types.JID
-	pn  types.JID
-	err error
+	lid      types.JID
+	pn       types.JID
+	mappings []store.LIDMapping
+	err      error
 }
 
-func (f *fakeAddContactLIDStore) PutManyLIDMappings(context.Context, []store.LIDMapping) error {
+func (f *fakeAddContactLIDStore) PutManyLIDMappings(_ context.Context, mappings []store.LIDMapping) error {
+	f.mappings = append(f.mappings, mappings...)
 	return nil
 }
 
@@ -36,6 +44,60 @@ func (f *fakeAddContactLIDStore) GetLIDForPN(context.Context, types.JID) (types.
 
 func (f *fakeAddContactLIDStore) GetManyLIDsForPNs(context.Context, []types.JID) (map[types.JID]types.JID, error) {
 	return nil, nil
+}
+
+type fakeAppStateContactStore struct {
+	entries []store.ContactEntry
+	jid     types.JID
+}
+
+func (f *fakeAppStateContactStore) PutPushName(context.Context, types.JID, string) (bool, string, error) {
+	return false, "", nil
+}
+
+func (f *fakeAppStateContactStore) PutBusinessName(context.Context, types.JID, string) (bool, string, error) {
+	return false, "", nil
+}
+
+func (f *fakeAppStateContactStore) PutContactName(_ context.Context, jid types.JID, _, _ string, _ bool) error {
+	f.jid = jid
+	return nil
+}
+
+func (f *fakeAppStateContactStore) PutAllContactNames(_ context.Context, entries []store.ContactEntry) error {
+	f.entries = append(f.entries, entries...)
+	return nil
+}
+
+func (f *fakeAppStateContactStore) PutManyRedactedPhones(context.Context, []store.RedactedPhoneEntry) error {
+	return nil
+}
+
+func (f *fakeAppStateContactStore) GetContact(context.Context, types.JID) (types.ContactInfo, error) {
+	return types.ContactInfo{}, nil
+}
+
+func (f *fakeAppStateContactStore) GetAllContacts(context.Context) (map[types.JID]types.ContactInfo, error) {
+	return nil, nil
+}
+
+func (f *fakeAppStateContactStore) GetContactListPage(context.Context, store.ContactListPageOptions) (store.ContactListPage, error) {
+	return store.ContactListPage{}, nil
+}
+
+func newContactMutation(pn, lid types.JID) appstate.Mutation {
+	return appstate.Mutation{
+		Index:     []string{appstate.IndexContact, pn.String()},
+		Operation: waServerSync.SyncdMutation_SET,
+		Action: &waSyncAction.SyncActionValue{
+			ContactAction: &waSyncAction.ContactAction{
+				FirstName: proto.String("Love"),
+				FullName:  proto.String("Love In Rush"),
+				LidJID:    proto.String(lid.String()),
+				PnJID:     proto.String(pn.String()),
+			},
+		},
+	}
 }
 
 func TestParsePhoneContactQueryResponse(t *testing.T) {
@@ -213,5 +275,42 @@ func TestCacheAddContactLIDMappingReturnsStoreError(t *testing.T) {
 	err := cli.cacheAddContactLIDMapping(context.Background(), identity)
 	if !errors.Is(err, expectedErr) {
 		t.Fatalf("expected store error, got %v", err)
+	}
+}
+
+func TestDispatchContactAppStateStoresLIDMapping(t *testing.T) {
+	lidStore := &fakeAddContactLIDStore{}
+	contactStore := &fakeAppStateContactStore{}
+	cli := &Client{Store: &store.Device{Contacts: contactStore, LIDs: lidStore}}
+	pn := types.NewJID("15167072015", types.DefaultUserServer)
+	lid := types.NewJID("101395722203279", types.HiddenUserServer)
+
+	cli.dispatchAppState(context.Background(), appstate.WAPatchCriticalUnblockLow, newContactMutation(pn, lid), false)
+
+	if lidStore.lid != lid || lidStore.pn != pn {
+		t.Fatalf("expected LID mapping %s -> %s, got %s -> %s", lid, pn, lidStore.lid, lidStore.pn)
+	}
+}
+
+func TestFullSyncContactSnapshotStoresLIDMappings(t *testing.T) {
+	lidStore := &fakeAddContactLIDStore{}
+	contactStore := &fakeAppStateContactStore{}
+	cli := &Client{Store: &store.Device{Contacts: contactStore, LIDs: lidStore}, Log: waLog.Noop}
+	pn := types.NewJID("15167072015", types.DefaultUserServer)
+	lid := types.NewJID("101395722203279", types.HiddenUserServer)
+
+	err := cli.collectEventsToDispatch(
+		context.Background(),
+		appstate.WAPatchCriticalUnblockLow,
+		[]appstate.Mutation{newContactMutation(pn, lid)},
+		true,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("unexpected collect error: %v", err)
+	}
+
+	if len(lidStore.mappings) != 1 || lidStore.mappings[0].LID != lid || lidStore.mappings[0].PN != pn {
+		t.Fatalf("expected full sync LID mapping %s -> %s, got %#v", lid, pn, lidStore.mappings)
 	}
 }
