@@ -699,6 +699,31 @@ const (
 		ORDER BY c.their_jid ASC
 		LIMIT $2 OFFSET $3
 	`
+	searchContactListQuery = `
+		SELECT
+			c.their_jid,
+			c.first_name,
+			c.full_name,
+			c.push_name,
+			c.business_name,
+			c.redacted_phone,
+			c.is_add_contact,
+			lm.lid
+		FROM whatsmeow_contacts c
+		LEFT JOIN whatsmeow_lid_map lm
+		  ON c.their_jid LIKE '%@s.whatsapp.net'
+		 AND replace(c.their_jid, '@s.whatsapp.net', '') = lm.pn
+		WHERE c.our_jid = $1
+		  AND c.is_add_contact=true
+		  AND (
+			c.their_jid LIKE $2
+			OR COALESCE(c.first_name, '') LIKE $2
+			OR COALESCE(c.full_name, '') LIKE $2
+			OR COALESCE(c.push_name, '') LIKE $2
+			OR COALESCE(c.business_name, '') LIKE $2
+		  )
+		ORDER BY c.their_jid ASC
+	`
 )
 
 var putContactNamesMassInsertBuilder = dbutil.NewMassInsertBuilder[store.ContactEntry, [1]any](
@@ -915,6 +940,12 @@ func (s *SQLStore) GetAllContacts(ctx context.Context) (map[types.JID]types.Cont
 }
 
 func normalizeContactListPageOptions(options store.ContactListPageOptions) store.ContactListPageOptions {
+	options.Keyword = strings.TrimSpace(options.Keyword)
+	if options.Keyword != "" {
+		options.Page = 1
+		options.PageSize = 0
+		return options
+	}
 	if options.Page <= 0 {
 		options.Page = 1
 	}
@@ -926,35 +957,14 @@ func normalizeContactListPageOptions(options store.ContactListPageOptions) store
 	return options
 }
 
-func (s *SQLStore) GetContactListPage(ctx context.Context, options store.ContactListPageOptions) (store.ContactListPage, error) {
-	options = normalizeContactListPageOptions(options)
-	page := store.ContactListPage{
-		List:     []store.ContactListPageEntry{},
-		Page:     options.Page,
-		PageSize: options.PageSize,
-	}
-
-	err := s.db.QueryRow(ctx, getContactListPageCountQuery, s.JID).Scan(&page.Total)
-	if err != nil {
-		return page, err
-	}
-	if page.Total > 0 {
-		page.TotalPages = (page.Total + options.PageSize - 1) / options.PageSize
-		page.HasMore = options.Page < page.TotalPages
-	}
-
-	offset := (options.Page - 1) * options.PageSize
-	rows, err := s.db.Query(ctx, getContactListPageQuery, s.JID, options.PageSize, offset)
-	if err != nil {
-		return page, err
-	}
+func appendContactListPageRows(page store.ContactListPage, rows dbutil.Rows) (store.ContactListPage, error) {
 	defer rows.Close()
 
 	for rows.Next() {
 		var jid types.JID
 		var first, full, push, business, redactedPhone, lidUser sql.NullString
 		var isAddContact bool
-		err = rows.Scan(&jid, &first, &full, &push, &business, &redactedPhone, &isAddContact, &lidUser)
+		err := rows.Scan(&jid, &first, &full, &push, &business, &redactedPhone, &isAddContact, &lidUser)
 		if err != nil {
 			return page, fmt.Errorf("error scanning row: %w", err)
 		}
@@ -981,6 +991,47 @@ func (s *SQLStore) GetContactListPage(ctx context.Context, options store.Contact
 		})
 	}
 	return page, rows.Err()
+}
+
+func (s *SQLStore) GetContactListPage(ctx context.Context, options store.ContactListPageOptions) (store.ContactListPage, error) {
+	options = normalizeContactListPageOptions(options)
+	page := store.ContactListPage{
+		List:     []store.ContactListPageEntry{},
+		Page:     options.Page,
+		PageSize: options.PageSize,
+	}
+
+	if options.Keyword != "" {
+		rows, err := s.db.Query(ctx, searchContactListQuery, s.JID, "%"+options.Keyword+"%")
+		if err != nil {
+			return page, err
+		}
+		page, err = appendContactListPageRows(page, rows)
+		if err != nil {
+			return page, err
+		}
+		page.Total = len(page.List)
+		if page.Total > 0 {
+			page.TotalPages = 1
+		}
+		return page, nil
+	}
+
+	err := s.db.QueryRow(ctx, getContactListPageCountQuery, s.JID).Scan(&page.Total)
+	if err != nil {
+		return page, err
+	}
+	if page.Total > 0 {
+		page.TotalPages = (page.Total + options.PageSize - 1) / options.PageSize
+		page.HasMore = options.Page < page.TotalPages
+	}
+
+	offset := (options.Page - 1) * options.PageSize
+	rows, err := s.db.Query(ctx, getContactListPageQuery, s.JID, options.PageSize, offset)
+	if err != nil {
+		return page, err
+	}
+	return appendContactListPageRows(page, rows)
 }
 
 const (

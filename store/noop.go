@@ -196,6 +196,13 @@ func (n *NoopStore) GetAllContacts(ctx context.Context) (map[types.JID]types.Con
 }
 
 func (n *NoopStore) GetContactListPage(ctx context.Context, options ContactListPageOptions) (ContactListPage, error) {
+	if options.Keyword != "" {
+		return ContactListPage{
+			List:  []ContactListPageEntry{},
+			Page:  1,
+			Total: 0,
+		}, nil
+	}
 	if options.Page <= 0 {
 		options.Page = 1
 	}

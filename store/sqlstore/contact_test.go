@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 )
 
@@ -66,6 +67,53 @@ func TestContactNameStoresAddressBookFlag(t *testing.T) {
 	}
 	if info.IsAddContact {
 		t.Fatal("expected non-contact rows to default to not address book contacts")
+	}
+}
+
+func TestContactListKeywordSearchMatchesJIDAndNames(t *testing.T) {
+	ctx := context.Background()
+	_, sqlStore := newTestSQLStore(t)
+
+	aliceJID := types.NewJID("8618825154033", types.DefaultUserServer)
+	bobJID := types.NewJID("15559876543", types.DefaultUserServer)
+	hiddenJID := types.NewJID("999888777", types.HiddenUserServer)
+	if err := sqlStore.PutContactName(ctx, aliceJID, "8618825154033", "Alice Example", true); err != nil {
+		t.Fatalf("failed to put alice contact: %v", err)
+	}
+	if _, _, err := sqlStore.PutPushName(ctx, aliceJID, "shamy"); err != nil {
+		t.Fatalf("failed to put alice push name: %v", err)
+	}
+	if err := sqlStore.PutContactName(ctx, bobJID, "Bob", "Phone Search Target", true); err != nil {
+		t.Fatalf("failed to put bob contact: %v", err)
+	}
+	if err := sqlStore.PutContactName(ctx, hiddenJID, "Hidden", "8618825154033 Hidden", false); err != nil {
+		t.Fatalf("failed to put hidden non-address-book contact: %v", err)
+	}
+
+	page, err := sqlStore.GetContactListPage(ctx, store.ContactListPageOptions{
+		Keyword: "8618825154033",
+	})
+	if err != nil {
+		t.Fatalf("failed to keyword search contacts: %v", err)
+	}
+	if page.Page != 1 || page.PageSize != 0 || page.Total != 1 || page.TotalPages != 1 || page.HasMore {
+		t.Fatalf("unexpected keyword pagination metadata: %+v", page)
+	}
+	if len(page.List) != 1 {
+		t.Fatalf("expected one keyword result, got %d: %+v", len(page.List), page.List)
+	}
+	if page.List[0].JID != aliceJID {
+		t.Fatalf("expected alice JID %s, got %s", aliceJID, page.List[0].JID)
+	}
+
+	page, err = sqlStore.GetContactListPage(ctx, store.ContactListPageOptions{
+		Keyword: "Search Target",
+	})
+	if err != nil {
+		t.Fatalf("failed to keyword search contacts by name: %v", err)
+	}
+	if len(page.List) != 1 || page.List[0].JID != bobJID {
+		t.Fatalf("expected bob result, got %+v", page.List)
 	}
 }
 

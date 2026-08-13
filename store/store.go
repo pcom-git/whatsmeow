@@ -103,6 +103,7 @@ func (rpe RedactedPhoneEntry) GetMassInsertValues() [2]any {
 type ContactListPageOptions struct {
 	Page     int
 	PageSize int
+	Keyword  string
 }
 
 type ContactListPageEntry struct {
