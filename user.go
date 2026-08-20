@@ -211,6 +211,84 @@ func (cli *Client) IsOnWhatsApp(ctx context.Context, phones []string) ([]types.I
 	return output, nil
 }
 
+// GetLIDForJID resolves a phone-number JID to an LID. It first checks the local LID mapping store, and if no mapping
+// is found, it queries WhatsApp using GetUserInfo. Successful network lookups are cached by GetUserInfo.
+//
+// If the input is already an LID, it is returned directly. The input must be a user JID (@s.whatsapp.net or @c.us)
+// or an LID (@lid).
+func (cli *Client) GetLIDForJID(ctx context.Context, jid types.JID) (types.JID, error) {
+	if cli == nil {
+		return types.EmptyJID, ErrClientIsNil
+	}
+	if jid.IsEmpty() || jid.User == "" {
+		return types.EmptyJID, fmt.Errorf("invalid JID %s", jid)
+	}
+	if jid.Server == types.HiddenUserServer {
+		return normalizeResolvedLIDForSource(jid, jid)
+	}
+	if cli.Store == nil || cli.Store.LIDs == nil {
+		return types.EmptyJID, errors.New("LID store is nil")
+	}
+
+	pn, err := normalizePNJIDForLIDLookup(jid)
+	if err != nil {
+		return types.EmptyJID, err
+	}
+
+	lid, err := cli.Store.LIDs.GetLIDForPN(ctx, pn)
+	if err != nil {
+		return types.EmptyJID, fmt.Errorf("failed to get local LID mapping for %s: %w", pn, err)
+	} else if !lid.IsEmpty() {
+		return normalizeResolvedLIDForSource(lid, jid)
+	}
+
+	userInfo, err := cli.GetUserInfo(ctx, []types.JID{pn})
+	if err != nil {
+		return types.EmptyJID, fmt.Errorf("failed to query LID for %s: %w", pn, err)
+	}
+	lid = findLIDInUserInfo(pn, userInfo)
+	if lid.IsEmpty() {
+		return types.EmptyJID, fmt.Errorf("no LID returned for %s", pn)
+	}
+	return normalizeResolvedLIDForSource(lid, jid)
+}
+
+func normalizePNJIDForLIDLookup(jid types.JID) (types.JID, error) {
+	jid = jid.ToNonAD()
+	switch jid.Server {
+	case types.DefaultUserServer:
+		return jid, nil
+	case types.LegacyUserServer:
+		return types.NewJID(jid.User, types.DefaultUserServer), nil
+	default:
+		return types.EmptyJID, fmt.Errorf("cannot resolve LID for non-user JID %s", jid)
+	}
+}
+
+func normalizeResolvedLIDForSource(lid, source types.JID) (types.JID, error) {
+	lid = lid.ToNonAD()
+	if lid.User == "" || lid.Server != types.HiddenUserServer {
+		return types.EmptyJID, fmt.Errorf("invalid resolved LID %s for %s", lid, source)
+	}
+	lid.Device = source.Device
+	return lid, nil
+}
+
+func findLIDInUserInfo(pn types.JID, userInfo map[types.JID]types.UserInfo) types.JID {
+	if info, ok := userInfo[pn]; ok {
+		return info.LID
+	}
+
+	pn = pn.ToNonAD()
+	for user, info := range userInfo {
+		user = user.ToNonAD()
+		if user == pn || (user.User == pn.User && user.Server == types.LegacyUserServer) {
+			return info.LID
+		}
+	}
+	return types.EmptyJID
+}
+
 // GetLIDByUsername resolves a WhatsApp username to an LID using an interactive USync query.
 func (cli *Client) GetLIDByUsername(ctx context.Context, username string) (types.JID, error) {
 	if cli == nil {
