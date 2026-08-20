@@ -115,10 +115,12 @@ type Client struct {
 	responseWaiters     map[string]chan<- *waBinary.Node
 	responseWaitersLock sync.Mutex
 
-	nodeHandlers      map[string]nodeHandler
-	handlerQueue      chan *waBinary.Node
-	eventHandlers     []wrappedEventHandler
-	eventHandlersLock sync.RWMutex
+	nodeHandlers        map[string]nodeHandler
+	handlerQueue        chan *waBinary.Node
+	messageHandlerQueue chan *waBinary.Node
+	regularHandlerQueue chan *waBinary.Node
+	eventHandlers       []wrappedEventHandler
+	eventHandlersLock   sync.RWMutex
 
 	messageRetries     map[messageRetryKey]int
 	messageRetriesLock sync.Mutex
@@ -251,21 +253,23 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 		Transport: (http.DefaultTransport.(*http.Transport)).Clone(),
 	}
 	cli := &Client{
-		mediaHTTP:          ptr.Clone(baseHTTPClient),
-		websocketHTTP:      ptr.Clone(baseHTTPClient),
-		preLoginHTTP:       ptr.Clone(baseHTTPClient),
-		Store:              deviceStore,
-		Log:                log,
-		recvLog:            log.Sub("Recv"),
-		sendLog:            log.Sub("Send"),
-		uniqueID:           fmt.Sprintf("%d.%d-", uniqueIDPrefix[0], uniqueIDPrefix[1]),
-		responseWaiters:    make(map[string]chan<- *waBinary.Node),
-		eventHandlers:      make([]wrappedEventHandler, 0, 1),
-		messageRetries:     make(map[messageRetryKey]int),
-		handlerQueue:       make(chan *waBinary.Node, handlerQueueSize),
-		appStateProc:       appstate.NewProcessor(deviceStore, log.Sub("AppState")),
-		socketWait:         make(chan struct{}),
-		expectedDisconnect: exsync.NewEvent(),
+		mediaHTTP:           ptr.Clone(baseHTTPClient),
+		websocketHTTP:       ptr.Clone(baseHTTPClient),
+		preLoginHTTP:        ptr.Clone(baseHTTPClient),
+		Store:               deviceStore,
+		Log:                 log,
+		recvLog:             log.Sub("Recv"),
+		sendLog:             log.Sub("Send"),
+		uniqueID:            fmt.Sprintf("%d.%d-", uniqueIDPrefix[0], uniqueIDPrefix[1]),
+		responseWaiters:     make(map[string]chan<- *waBinary.Node),
+		eventHandlers:       make([]wrappedEventHandler, 0, 1),
+		messageRetries:      make(map[messageRetryKey]int),
+		handlerQueue:        make(chan *waBinary.Node, handlerQueueSize),
+		messageHandlerQueue: make(chan *waBinary.Node, handlerQueueSize),
+		regularHandlerQueue: make(chan *waBinary.Node, handlerQueueSize),
+		appStateProc:        appstate.NewProcessor(deviceStore, log.Sub("AppState")),
+		socketWait:          make(chan struct{}),
+		expectedDisconnect:  exsync.NewEvent(),
 
 		incomingRetryRequestCounter: make(map[incomingRetryKey]int),
 
@@ -565,7 +569,8 @@ func (cli *Client) unlockedConnect(ctx context.Context) error {
 		return fmt.Errorf("noise handshake failed: %w", err)
 	}
 	go cli.keepAliveLoop(ctx, fs.Context())
-	go cli.handlerQueueLoop(ctx, fs.Context())
+	go cli.namedHandlerQueueLoop(ctx, fs.Context(), "message", cli.messageHandlerQueue)
+	go cli.namedHandlerQueueLoop(ctx, fs.Context(), "regular", cli.regularHandlerQueue)
 	return nil
 }
 
@@ -842,14 +847,16 @@ func (cli *Client) handleFrame(ctx context.Context, data []byte) {
 	} else if cli.receiveResponse(ctx, node) {
 		// handled
 	} else if _, ok := cli.nodeHandlers[node.Tag]; ok {
+		handlerQueue := cli.handlerQueueForNode(node)
+		queueName := cli.handlerQueueNameForNode(node)
 		select {
-		case cli.handlerQueue <- node:
+		case handlerQueue <- node:
 		case <-ctx.Done():
 		default:
-			cli.Log.Warnf("Handler queue is full, message ordering is no longer guaranteed")
+			cli.Log.Warnf("%s handler queue is full, message ordering is no longer guaranteed for %s", queueName, node.Tag)
 			go func() {
 				select {
-				case cli.handlerQueue <- node:
+				case handlerQueue <- node:
 				case <-ctx.Done():
 				}
 			}()
@@ -860,13 +867,31 @@ func (cli *Client) handleFrame(ctx context.Context, data []byte) {
 }
 
 func (cli *Client) handlerQueueLoop(evtCtx, connCtx context.Context) {
+	cli.namedHandlerQueueLoop(evtCtx, connCtx, "regular", cli.regularHandlerQueue)
+}
+
+func (cli *Client) handlerQueueForNode(node *waBinary.Node) chan *waBinary.Node {
+	if node != nil && (node.Tag == "message" || node.Tag == "appdata") {
+		return cli.messageHandlerQueue
+	}
+	return cli.regularHandlerQueue
+}
+
+func (cli *Client) handlerQueueNameForNode(node *waBinary.Node) string {
+	if node != nil && (node.Tag == "message" || node.Tag == "appdata") {
+		return "message"
+	}
+	return "regular"
+}
+
+func (cli *Client) namedHandlerQueueLoop(evtCtx, connCtx context.Context, queueName string, handlerQueue chan *waBinary.Node) {
 	ticker := time.NewTicker(30 * time.Second)
 	ticker.Stop()
-	cli.Log.Debugf("Starting handler queue loop")
+	cli.Log.Debugf("Starting %s handler queue loop", queueName)
 Loop:
 	for {
 		select {
-		case node := <-cli.handlerQueue:
+		case node := <-handlerQueue:
 			doneChan := make(chan struct{})
 			start := time.Now()
 			go func() {
@@ -874,7 +899,7 @@ Loop:
 				duration := time.Since(start)
 				close(doneChan)
 				if duration > 5*time.Second {
-					cli.Log.Warnf("Node handling took %s for %s", duration, node)
+					cli.Log.Warnf("%s node handling took %s for %s", queueName, duration, node)
 				}
 			}()
 			ticker.Reset(30 * time.Second)
@@ -884,13 +909,13 @@ Loop:
 					ticker.Stop()
 					continue Loop
 				case <-ticker.C:
-					cli.Log.Warnf("Node handling is taking long for %s (started %s ago)", node, time.Since(start))
+					cli.Log.Warnf("%s node handling is taking long for %s (started %s ago)", queueName, node, time.Since(start))
 				}
 			}
-			cli.Log.Warnf("Continuing handling of %s in background as it's taking too long", node)
+			cli.Log.Warnf("Continuing %s handling of %s in background as it's taking too long", queueName, node)
 			ticker.Stop()
 		case <-connCtx.Done():
-			cli.Log.Debugf("Closing handler queue loop")
+			cli.Log.Debugf("Closing %s handler queue loop", queueName)
 			return
 		}
 	}
