@@ -118,6 +118,7 @@ type Client struct {
 	nodeHandlers        map[string]nodeHandler
 	handlerQueue        chan *waBinary.Node
 	messageHandlerQueue chan *waBinary.Node
+	receiptHandlerQueue chan *waBinary.Node
 	regularHandlerQueue chan *waBinary.Node
 	eventHandlers       []wrappedEventHandler
 	eventHandlersLock   sync.RWMutex
@@ -266,6 +267,7 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 		messageRetries:      make(map[messageRetryKey]int),
 		handlerQueue:        make(chan *waBinary.Node, handlerQueueSize),
 		messageHandlerQueue: make(chan *waBinary.Node, handlerQueueSize),
+		receiptHandlerQueue: make(chan *waBinary.Node, handlerQueueSize),
 		regularHandlerQueue: make(chan *waBinary.Node, handlerQueueSize),
 		appStateProc:        appstate.NewProcessor(deviceStore, log.Sub("AppState")),
 		socketWait:          make(chan struct{}),
@@ -570,6 +572,7 @@ func (cli *Client) unlockedConnect(ctx context.Context) error {
 	}
 	go cli.keepAliveLoop(ctx, fs.Context())
 	go cli.namedHandlerQueueLoop(ctx, fs.Context(), "message", cli.messageHandlerQueue)
+	go cli.namedHandlerQueueLoop(ctx, fs.Context(), "receipt", cli.receiptHandlerQueue)
 	go cli.namedHandlerQueueLoop(ctx, fs.Context(), "regular", cli.regularHandlerQueue)
 	return nil
 }
@@ -874,12 +877,18 @@ func (cli *Client) handlerQueueForNode(node *waBinary.Node) chan *waBinary.Node 
 	if node != nil && (node.Tag == "message" || node.Tag == "appdata") {
 		return cli.messageHandlerQueue
 	}
+	if node != nil && node.Tag == "receipt" {
+		return cli.receiptHandlerQueue
+	}
 	return cli.regularHandlerQueue
 }
 
 func (cli *Client) handlerQueueNameForNode(node *waBinary.Node) string {
 	if node != nil && (node.Tag == "message" || node.Tag == "appdata") {
 		return "message"
+	}
+	if node != nil && node.Tag == "receipt" {
+		return "receipt"
 	}
 	return "regular"
 }
