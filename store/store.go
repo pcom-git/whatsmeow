@@ -157,6 +157,7 @@ type GroupListPageEntry struct {
 	ParticipantCount              int
 	MemberAddMode                 types.GroupMemberAddMode
 	Suspended                     bool
+	LastSyncAt                    time.Time
 }
 
 type GroupListPage struct {

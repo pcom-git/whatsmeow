@@ -71,13 +71,16 @@ const (
 			suspended=excluded.suspended,
 			is_joined=true,
 			is_deleted=false,
-			last_sync_at=excluded.last_sync_at,
+			last_sync_at=CASE
+				WHEN excluded.last_sync_at > 0 THEN excluded.last_sync_at
+				ELSE whatsmeow_groups.last_sync_at
+			END,
 			updated_at=excluded.updated_at,
 			raw_info=excluded.raw_info
 	`
 	ensureGroupQuery = `
 		INSERT INTO whatsmeow_groups (our_jid, group_jid, last_sync_at, updated_at)
-		VALUES ($1, $2, $3, $3)
+		VALUES ($1, $2, 0, $3)
 		ON CONFLICT (our_jid, group_jid) DO UPDATE SET updated_at=excluded.updated_at
 	`
 	upsertActiveGroupMemberQuery = `
@@ -116,6 +119,11 @@ const (
 			left_at=excluded.left_at,
 			participant_version_id=excluded.participant_version_id,
 			updated_at=excluded.updated_at
+	`
+	markGroupMemberLeftQuery = `
+		UPDATE whatsmeow_group_members
+		SET status='left', left_at=$4, participant_version_id=$5, updated_at=$4
+		WHERE our_jid=$1 AND group_jid=$2 AND member_jid=$3 AND status='active'
 	`
 	recalculateGroupParticipantCountQuery = `
 		UPDATE whatsmeow_groups
@@ -184,7 +192,8 @@ const (
 			g.is_join_approval_required,
 			COALESCE(active_members.active_count, g.participant_count),
 			g.member_add_mode,
-			g.suspended
+			g.suspended,
+			g.last_sync_at
 		FROM whatsmeow_groups g
 		LEFT JOIN (
 			SELECT our_jid, group_jid, COUNT(*) AS active_count
@@ -284,11 +293,15 @@ func groupParticipantCount(group *types.GroupInfo) int {
 	return len(group.Participants)
 }
 
-func (s *SQLStore) upsertGroup(ctx context.Context, group *types.GroupInfo, syncedAt time.Time) error {
+func (s *SQLStore) upsertGroup(ctx context.Context, group *types.GroupInfo, syncedAt time.Time, memberSnapshot bool) error {
 	if group == nil || group.JID.IsEmpty() {
 		return nil
 	}
 	ts := groupEventUnix(syncedAt)
+	lastSyncAt := int64(0)
+	if memberSnapshot {
+		lastSyncAt = ts
+	}
 	_, err := s.db.Exec(ctx, upsertGroupQuery,
 		s.JID,
 		jidString(group.JID),
@@ -312,7 +325,7 @@ func (s *SQLStore) upsertGroup(ctx context.Context, group *types.GroupInfo, sync
 		group.Suspended,
 		true,
 		false,
-		ts,
+		lastSyncAt,
 		ts,
 		nil,
 	)
@@ -414,7 +427,6 @@ func (s *SQLStore) replaceGroupMembers(ctx context.Context, groupJID types.JID, 
 	if groupJID.IsEmpty() {
 		return nil
 	}
-	memberIDs := make([]string, 0, len(members))
 	seenMembers := make(map[string]struct{}, len(members))
 	for _, member := range members {
 		member = normalizeParticipant(member)
@@ -426,14 +438,13 @@ func (s *SQLStore) replaceGroupMembers(ctx context.Context, groupJID types.JID, 
 			continue
 		}
 		seenMembers[memberID] = struct{}{}
-		memberIDs = append(memberIDs, memberID)
 		if err := s.upsertActiveGroupMember(ctx, groupJID, member, versionID, syncedAt); err != nil {
 			return err
 		}
 	}
 
 	ts := groupEventUnix(syncedAt)
-	if len(memberIDs) == 0 {
+	if len(seenMembers) == 0 {
 		_, err := s.db.Exec(ctx, `
 			UPDATE whatsmeow_group_members
 			SET status='left', left_at=$3, participant_version_id=$4, updated_at=$3
@@ -443,22 +454,36 @@ func (s *SQLStore) replaceGroupMembers(ctx context.Context, groupJID types.JID, 
 			return err
 		}
 	} else {
-		args := make([]any, 4, 4+len(memberIDs))
-		args[0] = s.JID
-		args[1] = jidString(groupJID)
-		args[2] = ts
-		args[3] = versionID
-		for _, memberID := range memberIDs {
-			args = append(args, memberID)
-		}
-		query := fmt.Sprintf(`
-			UPDATE whatsmeow_group_members
-			SET status='left', left_at=$3, participant_version_id=$4, updated_at=$3
-			WHERE our_jid=$1 AND group_jid=$2 AND status='active' AND member_jid NOT IN (%s)
-		`, strings.Join(sqlPlaceholders(5, len(memberIDs)), ","))
-		_, err := s.db.Exec(ctx, query, args...)
+		rows, err := s.db.Query(ctx, `
+			SELECT member_jid
+			FROM whatsmeow_group_members
+			WHERE our_jid=$1 AND group_jid=$2 AND status='active'
+		`, s.JID, jidString(groupJID))
 		if err != nil {
 			return err
+		}
+		missingMemberIDs := make([]string, 0)
+		for rows.Next() {
+			var memberID string
+			if err = rows.Scan(&memberID); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			if _, ok := seenMembers[memberID]; !ok {
+				missingMemberIDs = append(missingMemberIDs, memberID)
+			}
+		}
+		if err = rows.Err(); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if err = rows.Close(); err != nil {
+			return err
+		}
+		for _, memberID := range missingMemberIDs {
+			if _, err = s.db.Exec(ctx, markGroupMemberLeftQuery, s.JID, jidString(groupJID), memberID, ts, versionID); err != nil {
+				return err
+			}
 		}
 	}
 	return s.recalculateGroupParticipantCount(ctx, groupJID, syncedAt)
@@ -482,10 +507,11 @@ func (s *SQLStore) PutJoinedGroupsSnapshot(ctx context.Context, groups []*types.
 			}
 			seenGroups[groupID] = struct{}{}
 			groupIDs = append(groupIDs, groupID)
-			if err := s.upsertGroup(ctx, group, syncedAt); err != nil {
+			replaceMembers := shouldReplaceGroupMembers(group)
+			if err := s.upsertGroup(ctx, group, syncedAt, replaceMembers); err != nil {
 				return err
 			}
-			if shouldReplaceGroupMembers(group) {
+			if replaceMembers {
 				if err := s.replaceGroupMembers(ctx, group.JID, group.Participants, group.ParticipantVersionID, syncedAt); err != nil {
 					return err
 				}
@@ -520,10 +546,11 @@ func (s *SQLStore) PutGroupInfoSnapshot(ctx context.Context, group *types.GroupI
 		return nil
 	}
 	return s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
-		if err := s.upsertGroup(ctx, group, syncedAt); err != nil {
+		replaceMembers := shouldReplaceGroupMembers(group)
+		if err := s.upsertGroup(ctx, group, syncedAt, replaceMembers); err != nil {
 			return err
 		}
-		if shouldReplaceGroupMembers(group) {
+		if replaceMembers {
 			return s.replaceGroupMembers(ctx, group.JID, group.Participants, group.ParticipantVersionID, syncedAt)
 		}
 		return nil
@@ -650,6 +677,7 @@ func scanGroupListPageEntry(row dbutil.Scannable) (store.GroupListPageEntry, err
 	var entry store.GroupListPageEntry
 	var disappearingTimer int64
 	var memberAddMode string
+	var lastSyncAt int64
 	err := row.Scan(
 		&entry.GroupID,
 		&entry.OwnerJID,
@@ -668,9 +696,13 @@ func scanGroupListPageEntry(row dbutil.Scannable) (store.GroupListPageEntry, err
 		&entry.ParticipantCount,
 		&memberAddMode,
 		&entry.Suspended,
+		&lastSyncAt,
 	)
 	entry.DisappearingTimer = uint32(disappearingTimer)
 	entry.MemberAddMode = types.GroupMemberAddMode(memberAddMode)
+	if lastSyncAt > 0 {
+		entry.LastSyncAt = time.Unix(lastSyncAt, 0)
+	}
 	return entry, err
 }
 
