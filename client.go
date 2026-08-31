@@ -90,7 +90,8 @@ type Client struct {
 	sendActiveReceipts atomic.Uint32
 
 	// EmitAppStateEventsOnFullSync can be set to true if you want to get app state events emitted
-	// even when re-syncing the whole state.
+	// even when re-syncing the whole state. PushNameSetting is always emitted during full sync so
+	// callers can detect when the current user's push name becomes available.
 	EmitAppStateEventsOnFullSync bool
 	AppStateDebugLogs            bool
 

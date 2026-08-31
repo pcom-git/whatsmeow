@@ -69,10 +69,7 @@ func (cli *Client) fetchAppState(ctx context.Context, name appstate.WAPatchName,
 	hasMore := true
 	wantSnapshot := fullSync
 	var eventsToDispatch []any
-	eventsToDispatchPtr := &eventsToDispatch
-	if fullSync && !cli.EmitAppStateEventsOnFullSync {
-		eventsToDispatchPtr = nil
-	}
+	emitAllEvents := !fullSync || cli.EmitAppStateEventsOnFullSync
 	for hasMore {
 		patches, err := cli.fetchAppStatePatches(ctx, name, state.Version, wantSnapshot)
 		if err != nil {
@@ -84,7 +81,7 @@ func (cli *Client) fetchAppState(ctx context.Context, name appstate.WAPatchName,
 		}
 		wantSnapshot = false
 		hasMore = patches.HasMorePatches
-		state, err = cli.applyAppStatePatches(ctx, name, state, patches, fullSync, eventsToDispatchPtr)
+		state, err = cli.applyAppStatePatchesWithPolicy(ctx, name, state, patches, fullSync, &eventsToDispatch, emitAllEvents)
 		if err != nil {
 			return nil, err
 		}
@@ -110,10 +107,7 @@ func (cli *Client) handleAppStateRecovery(
 		cli.Log.Warnf("Unexpected number of app state recovery results for %s: %d", reqID, len(result))
 	}
 	var eventsToDispatch []any
-	eventsToDispatchPtr := &eventsToDispatch
-	if !cli.EmitAppStateEventsOnFullSync {
-		eventsToDispatchPtr = nil
-	}
+	emitAllEvents := cli.EmitAppStateEventsOnFullSync
 	snapshot, err := appstate.ParseRecovery(result[0].GetSyncdSnapshotFatalRecoveryResponse())
 	if err != nil {
 		cli.Log.Warnf("Failed to parse app state recovery blob for %s: %v", reqID, err)
@@ -135,7 +129,7 @@ func (cli *Client) handleAppStateRecovery(
 		cli.Log.Warnf("Failed to parse app state recovery blob for %s: %v", reqID, err)
 		return true
 	}
-	err = cli.collectEventsToDispatch(ctx, name, mutations, true, eventsToDispatchPtr)
+	err = cli.collectEventsToDispatchWithPolicy(ctx, name, mutations, true, &eventsToDispatch, emitAllEvents)
 	if err != nil {
 		cli.Log.Warnf("Failed to collect app state events for %s: %v", reqID, err)
 		return true
@@ -159,6 +153,18 @@ func (cli *Client) applyAppStatePatches(
 	fullSync bool,
 	eventsToDispatch *[]any,
 ) (appstate.HashState, error) {
+	return cli.applyAppStatePatchesWithPolicy(ctx, name, state, patches, fullSync, eventsToDispatch, eventsToDispatch != nil)
+}
+
+func (cli *Client) applyAppStatePatchesWithPolicy(
+	ctx context.Context,
+	name appstate.WAPatchName,
+	state appstate.HashState,
+	patches *appstate.PatchList,
+	fullSync bool,
+	eventsToDispatch *[]any,
+	emitAllEvents bool,
+) (appstate.HashState, error) {
 	mutations, newState, err := cli.appStateProc.DecodePatches(ctx, patches, state, true)
 	if err != nil {
 		if errors.Is(err, appstate.ErrKeyNotFound) {
@@ -168,7 +174,7 @@ func (cli *Client) applyAppStatePatches(
 		}
 		return state, fmt.Errorf("failed to decode app state %s patches: %w", name, err)
 	}
-	return newState, cli.collectEventsToDispatch(ctx, name, mutations, fullSync, eventsToDispatch)
+	return newState, cli.collectEventsToDispatchWithPolicy(ctx, name, mutations, fullSync, eventsToDispatch, emitAllEvents)
 }
 
 func (cli *Client) collectEventsToDispatch(
@@ -177,6 +183,17 @@ func (cli *Client) collectEventsToDispatch(
 	mutations []appstate.Mutation,
 	fullSync bool,
 	eventsToDispatch *[]any,
+) error {
+	return cli.collectEventsToDispatchWithPolicy(ctx, name, mutations, fullSync, eventsToDispatch, eventsToDispatch != nil)
+}
+
+func (cli *Client) collectEventsToDispatchWithPolicy(
+	ctx context.Context,
+	name appstate.WAPatchName,
+	mutations []appstate.Mutation,
+	fullSync bool,
+	eventsToDispatch *[]any,
+	emitAllEvents bool,
 ) error {
 	if name == appstate.WAPatchCriticalUnblockLow && fullSync && !cli.EmitAppStateEventsOnFullSync {
 		var contacts []store.ContactEntry
@@ -196,11 +213,13 @@ func (cli *Client) collectEventsToDispatch(
 		}
 	}
 	for _, mutation := range mutations {
-		if eventsToDispatch != nil && mutation.Operation == waServerSync.SyncdMutation_SET {
+		if eventsToDispatch != nil && emitAllEvents && mutation.Operation == waServerSync.SyncdMutation_SET {
 			*eventsToDispatch = append(*eventsToDispatch, &events.AppState{Index: mutation.Index, SyncActionValue: mutation.Action})
 		}
 		evt := cli.dispatchAppState(ctx, name, mutation, fullSync)
-		if eventsToDispatch != nil && evt != nil {
+		_, isPushNameSetting := evt.(*events.PushNameSetting)
+		emitPushNameSetting := fullSync && name == appstate.WAPatchCriticalBlock && isPushNameSetting
+		if eventsToDispatch != nil && evt != nil && (emitAllEvents || emitPushNameSetting) {
 			*eventsToDispatch = append(*eventsToDispatch, evt)
 		}
 	}

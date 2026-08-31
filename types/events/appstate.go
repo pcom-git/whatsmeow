@@ -120,7 +120,9 @@ type DeleteChat struct {
 	DeleteMedia  bool
 }
 
-// PushNameSetting is emitted when the user's push name is changed from another device.
+// PushNameSetting is emitted when the current user's push name is synced or changed.
+// Unlike other app state events, it is also emitted during full sync when
+// Client.EmitAppStateEventsOnFullSync is false.
 type PushNameSetting struct {
 	Timestamp time.Time // The time when the push name was changed.
 
