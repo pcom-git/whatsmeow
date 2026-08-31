@@ -116,13 +116,16 @@ type Client struct {
 	responseWaiters     map[string]chan<- *waBinary.Node
 	responseWaitersLock sync.Mutex
 
-	nodeHandlers        map[string]nodeHandler
-	handlerQueue        chan *waBinary.Node
-	messageHandlerQueue chan *waBinary.Node
-	receiptHandlerQueue chan *waBinary.Node
-	regularHandlerQueue chan *waBinary.Node
-	eventHandlers       []wrappedEventHandler
-	eventHandlersLock   sync.RWMutex
+	nodeHandlers         map[string]nodeHandler
+	handlerQueue         chan *waBinary.Node
+	messageHandlerQueue  chan *waBinary.Node
+	receiptHandlerQueue  chan *waBinary.Node
+	regularHandlerQueue  chan *waBinary.Node
+	eventHandlers        []wrappedEventHandler
+	messageEventHandlers []wrappedEventHandler
+	receiptEventHandlers []wrappedEventHandler
+	regularEventHandlers []wrappedEventHandler
+	eventHandlersLock    sync.RWMutex
 
 	messageRetries     map[messageRetryKey]int
 	messageRetriesLock sync.Mutex
@@ -744,19 +747,20 @@ func (cli *Client) Logout(ctx context.Context) error {
 	return nil
 }
 
-// AddEventHandler registers a new function to receive all events emitted by this client.
+// AddEventHandler registers a new function to receive regular events emitted by this client.
 //
 // The returned integer is the event handler ID, which can be passed to RemoveEventHandler to remove it.
 //
-// All registered event handlers will receive all events. You should use a type switch statement to
-// filter the events you want:
+// Message and receipt events are dispatched through the dedicated handlers registered with
+// AddMessageEventHandler and AddReceiptEventHandler. Use a type switch statement to filter the regular
+// events you want:
 //
 //	func myEventHandler(evt any) {
 //		switch v := evt.(type) {
-//		case *events.Message:
-//			fmt.Println("Received a message!")
-//		case *events.Receipt:
-//			fmt.Println("Received a receipt!")
+//		case *events.Connected:
+//			fmt.Println("Connected!")
+//		case *events.StreamError:
+//			fmt.Println("Received a stream error!")
 //		}
 //	}
 //
@@ -783,9 +787,49 @@ func (cli *Client) AddEventHandler(handler EventHandler) uint32 {
 }
 
 func (cli *Client) AddEventHandlerWithSuccessStatus(handler EventHandlerWithSuccessStatus) uint32 {
+	return cli.addEventHandlerTo(&cli.eventHandlers, handler)
+}
+
+// AddMessageEventHandler registers a new function to receive message events emitted by this client.
+func (cli *Client) AddMessageEventHandler(handler EventHandler) uint32 {
+	return cli.AddMessageEventHandlerWithSuccessStatus(func(evt any) bool {
+		handler(evt)
+		return true
+	})
+}
+
+func (cli *Client) AddMessageEventHandlerWithSuccessStatus(handler EventHandlerWithSuccessStatus) uint32 {
+	return cli.addEventHandlerTo(&cli.messageEventHandlers, handler)
+}
+
+// AddReceiptEventHandler registers a new function to receive receipt events emitted by this client.
+func (cli *Client) AddReceiptEventHandler(handler EventHandler) uint32 {
+	return cli.AddReceiptEventHandlerWithSuccessStatus(func(evt any) bool {
+		handler(evt)
+		return true
+	})
+}
+
+func (cli *Client) AddReceiptEventHandlerWithSuccessStatus(handler EventHandlerWithSuccessStatus) uint32 {
+	return cli.addEventHandlerTo(&cli.receiptEventHandlers, handler)
+}
+
+// AddRegularEventHandler registers a new function to receive regular non-message and non-receipt events emitted by this client.
+func (cli *Client) AddRegularEventHandler(handler EventHandler) uint32 {
+	return cli.AddRegularEventHandlerWithSuccessStatus(func(evt any) bool {
+		handler(evt)
+		return true
+	})
+}
+
+func (cli *Client) AddRegularEventHandlerWithSuccessStatus(handler EventHandlerWithSuccessStatus) uint32 {
+	return cli.addEventHandlerTo(&cli.regularEventHandlers, handler)
+}
+
+func (cli *Client) addEventHandlerTo(handlers *[]wrappedEventHandler, handler EventHandlerWithSuccessStatus) uint32 {
 	nextID := atomic.AddUint32(&nextHandlerID, 1)
 	cli.eventHandlersLock.Lock()
-	cli.eventHandlers = append(cli.eventHandlers, wrappedEventHandler{handler, nextID})
+	*handlers = append(*handlers, wrappedEventHandler{handler, nextID})
 	cli.eventHandlersLock.Unlock()
 	return nextID
 }
@@ -805,19 +849,34 @@ func (cli *Client) AddEventHandlerWithSuccessStatus(handler EventHandlerWithSucc
 func (cli *Client) RemoveEventHandler(id uint32) bool {
 	cli.eventHandlersLock.Lock()
 	defer cli.eventHandlersLock.Unlock()
-	for index := range cli.eventHandlers {
-		if cli.eventHandlers[index].id == id {
-			if index == 0 {
-				cli.eventHandlers[0].fn = nil
-				cli.eventHandlers = cli.eventHandlers[1:]
-				return true
-			} else if index < len(cli.eventHandlers)-1 {
-				copy(cli.eventHandlers[index:], cli.eventHandlers[index+1:])
-			}
-			cli.eventHandlers[len(cli.eventHandlers)-1].fn = nil
-			cli.eventHandlers = cli.eventHandlers[:len(cli.eventHandlers)-1]
+	for _, handlers := range []*[]wrappedEventHandler{
+		&cli.eventHandlers,
+		&cli.messageEventHandlers,
+		&cli.receiptEventHandlers,
+		&cli.regularEventHandlers,
+	} {
+		if removeWrappedEventHandler(handlers, id) {
 			return true
 		}
+	}
+	return false
+}
+
+func removeWrappedEventHandler(handlers *[]wrappedEventHandler, id uint32) bool {
+	for index := range *handlers {
+		if (*handlers)[index].id != id {
+			continue
+		}
+		if index == 0 {
+			(*handlers)[0].fn = nil
+			*handlers = (*handlers)[1:]
+			return true
+		} else if index < len(*handlers)-1 {
+			copy((*handlers)[index:], (*handlers)[index+1:])
+		}
+		(*handlers)[len(*handlers)-1].fn = nil
+		*handlers = (*handlers)[:len(*handlers)-1]
+		return true
 	}
 	return false
 }
@@ -826,6 +885,9 @@ func (cli *Client) RemoveEventHandler(id uint32) bool {
 func (cli *Client) RemoveEventHandlers() {
 	cli.eventHandlersLock.Lock()
 	cli.eventHandlers = make([]wrappedEventHandler, 0, 1)
+	cli.messageEventHandlers = make([]wrappedEventHandler, 0, 1)
+	cli.receiptEventHandlers = make([]wrappedEventHandler, 0, 1)
+	cli.regularEventHandlers = make([]wrappedEventHandler, 0, 1)
 	cli.eventHandlersLock.Unlock()
 }
 
@@ -957,6 +1019,22 @@ func (cli *Client) sendNode(ctx context.Context, node waBinary.Node) error {
 }
 
 func (cli *Client) dispatchEvent(evt any) (handlerFailed bool) {
+	return cli.dispatchRegularEvent(evt)
+}
+
+func (cli *Client) dispatchMessageEvent(evt any) (handlerFailed bool) {
+	return cli.dispatchEventToHandlers(evt, &cli.messageEventHandlers)
+}
+
+func (cli *Client) dispatchReceiptEvent(evt any) (handlerFailed bool) {
+	return cli.dispatchEventToHandlers(evt, &cli.receiptEventHandlers)
+}
+
+func (cli *Client) dispatchRegularEvent(evt any) (handlerFailed bool) {
+	return cli.dispatchEventToHandlers(evt, &cli.regularEventHandlers, &cli.eventHandlers)
+}
+
+func (cli *Client) dispatchEventToHandlers(evt any, handlerSets ...*[]wrappedEventHandler) (handlerFailed bool) {
 	cli.eventHandlersLock.RLock()
 	defer func() {
 		cli.eventHandlersLock.RUnlock()
@@ -965,9 +1043,11 @@ func (cli *Client) dispatchEvent(evt any) (handlerFailed bool) {
 			cli.Log.Errorf("Event handler panicked while handling a %T: %v\n%s", evt, err, debug.Stack())
 		}
 	}()
-	for _, handler := range cli.eventHandlers {
-		if !handler.fn(evt) {
-			return true
+	for _, handlers := range handlerSets {
+		for _, handler := range *handlers {
+			if !handler.fn(evt) {
+				return true
+			}
 		}
 	}
 	return false

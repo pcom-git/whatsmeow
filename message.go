@@ -286,7 +286,7 @@ func (cli *Client) handlePlaintextMessage(ctx context.Context, info *types.Messa
 			OriginalTS: meta.AttrGetter().UnixTime("original_msg_t"),
 		}
 	}
-	return cli.dispatchEvent(evt.UnwrapRaw())
+	return cli.dispatchMessageEvent(evt.UnwrapRaw())
 }
 
 func (cli *Client) migrateSessionStore(ctx context.Context, pn, lid types.JID) {
@@ -311,7 +311,7 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 			cli.immediateRequestMessageFromPhone(ctx, info)
 			cli.sendAck(ctx, node, 0)
 		})
-		cli.dispatchEvent(&events.UndecryptableMessage{Info: *info, IsUnavailable: true, UnavailableType: uType})
+		cli.dispatchMessageEvent(&events.UndecryptableMessage{Info: *info, IsUnavailable: true, UnavailableType: uType})
 		return
 	}
 
@@ -420,7 +420,7 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 				}(ag.OptionalInt("count"))
 				go cli.sendAck(ctx, node, 0)
 			}
-			cli.dispatchEvent(&events.UndecryptableMessage{
+			cli.dispatchMessageEvent(&events.UndecryptableMessage{
 				Info:            *info,
 				IsUnavailable:   isUnavailable,
 				DecryptFailMode: events.DecryptFailMode(ag.OptionalString("decrypt-fail")),
@@ -468,7 +468,7 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 						}(retryCount)
 						go cli.sendAck(ctx, node, 0)
 					}
-					cli.dispatchEvent(&events.UndecryptableMessage{
+					cli.dispatchMessageEvent(&events.UndecryptableMessage{
 						Info:            *info,
 						DecryptFailMode: events.DecryptFailMode(ag.OptionalString("decrypt-fail")),
 					})
@@ -896,7 +896,7 @@ func (cli *Client) handlePlaceholderResendResponse(msg *waE2E.PeerDataOperationR
 			cli.Log.Warnf("Failed to parse web message info in item #%d of response to %s: %v", i+1, reqID, err)
 		} else {
 			msgEvt.UnavailableRequestID = reqID
-			ok = !cli.dispatchEvent(msgEvt) && ok
+			ok = !cli.dispatchMessageEvent(msgEvt) && ok
 		}
 	}
 	return
@@ -1164,7 +1164,7 @@ func (cli *Client) handleDecryptedMessage(ctx context.Context, info *types.Messa
 		return false
 	}
 	evt := &events.Message{Info: *info, RawMessage: msg, RetryCount: retryCount}
-	return cli.dispatchEvent(evt.UnwrapRaw())
+	return cli.dispatchMessageEvent(evt.UnwrapRaw())
 }
 
 // SendProtocolMessageReceipt sends a receipt for a protocol message back to the phone.

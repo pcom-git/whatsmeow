@@ -9,6 +9,7 @@ import (
 func TestHandlerQueueForNodeSeparatesMessagesFromRegularEvents(t *testing.T) {
 	cli := &Client{
 		messageHandlerQueue: make(chan *binary.Node, 1),
+		receiptHandlerQueue: make(chan *binary.Node, 1),
 		regularHandlerQueue: make(chan *binary.Node, 1),
 	}
 
@@ -19,7 +20,7 @@ func TestHandlerQueueForNodeSeparatesMessagesFromRegularEvents(t *testing.T) {
 	}{
 		{name: "message node", tag: "message", want: cli.messageHandlerQueue},
 		{name: "appdata node", tag: "appdata", want: cli.messageHandlerQueue},
-		{name: "receipt node", tag: "receipt", want: cli.regularHandlerQueue},
+		{name: "receipt node", tag: "receipt", want: cli.receiptHandlerQueue},
 	}
 
 	for _, tt := range tests {
