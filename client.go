@@ -120,6 +120,7 @@ type Client struct {
 	handlerQueue         chan *waBinary.Node
 	messageHandlerQueue  chan *waBinary.Node
 	receiptHandlerQueue  chan *waBinary.Node
+	statusHandlerQueue   chan *waBinary.Node
 	regularHandlerQueue  chan *waBinary.Node
 	eventHandlers        []wrappedEventHandler
 	messageEventHandlers []wrappedEventHandler
@@ -272,6 +273,7 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 		handlerQueue:        make(chan *waBinary.Node, handlerQueueSize),
 		messageHandlerQueue: make(chan *waBinary.Node, handlerQueueSize),
 		receiptHandlerQueue: make(chan *waBinary.Node, handlerQueueSize),
+		statusHandlerQueue:  make(chan *waBinary.Node, handlerQueueSize),
 		regularHandlerQueue: make(chan *waBinary.Node, handlerQueueSize),
 		appStateProc:        appstate.NewProcessor(deviceStore, log.Sub("AppState")),
 		socketWait:          make(chan struct{}),
@@ -306,6 +308,7 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 		"chatstate":    cli.handleChatState,
 		"presence":     cli.handlePresence,
 		"notification": cli.handleNotification,
+		"status":       cli.handleStatus,
 		"success":      cli.handleConnectSuccess,
 		"failure":      cli.handleConnectFailure,
 		"stream:error": cli.handleStreamError,
@@ -577,6 +580,7 @@ func (cli *Client) unlockedConnect(ctx context.Context) error {
 	go cli.keepAliveLoop(ctx, fs.Context())
 	go cli.namedHandlerQueueLoop(ctx, fs.Context(), "message", cli.messageHandlerQueue)
 	go cli.namedHandlerQueueLoop(ctx, fs.Context(), "receipt", cli.receiptHandlerQueue)
+	go cli.namedHandlerQueueLoop(ctx, fs.Context(), "status", cli.statusHandlerQueue)
 	go cli.namedHandlerQueueLoop(ctx, fs.Context(), "regular", cli.regularHandlerQueue)
 	return nil
 }
@@ -943,6 +947,9 @@ func (cli *Client) handlerQueueForNode(node *waBinary.Node) chan *waBinary.Node 
 	if node != nil && node.Tag == "receipt" {
 		return cli.receiptHandlerQueue
 	}
+	if node != nil && node.Tag == "status" {
+		return cli.statusHandlerQueue
+	}
 	return cli.regularHandlerQueue
 }
 
@@ -952,6 +959,9 @@ func (cli *Client) handlerQueueNameForNode(node *waBinary.Node) string {
 	}
 	if node != nil && node.Tag == "receipt" {
 		return "receipt"
+	}
+	if node != nil && node.Tag == "status" {
+		return "status"
 	}
 	return "regular"
 }
