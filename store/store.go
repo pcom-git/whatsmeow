@@ -323,6 +323,27 @@ type GroupStore interface {
 	GetGroupMemberListPage(ctx context.Context, options GroupMemberListPageOptions) (GroupMemberListPage, error)
 }
 
+// GroupSendPermission is the locally stored projection used to decide whether
+// the current account may post a new message to a group. StateKnown is false
+// when the group/member snapshot has not been initialized completely.
+type GroupSendPermission struct {
+	StateKnown   bool
+	IsJoined     bool
+	IsAnnounce   bool
+	IsMember     bool
+	IsAdmin      bool
+	IsSuperAdmin bool
+	Suspended    bool
+	LastSyncAt   time.Time
+}
+
+// GroupPermissionStore is an optional extension implemented by stores that
+// persist group metadata and membership. Keeping it separate from GroupStore
+// avoids breaking third-party GroupStore implementations.
+type GroupPermissionStore interface {
+	GetGroupSendPermission(ctx context.Context, groupJID, ownPN, ownLID types.JID) (*GroupSendPermission, error)
+}
+
 var MutedForever = time.Date(9999, 12, 31, 23, 59, 59, 999999999, time.UTC)
 
 type ChatSettingsStore interface {

@@ -559,6 +559,12 @@ func (cli *Client) GetJoinedGroups(ctx context.Context) ([]*types.GroupInfo, err
 		err = cli.Store.Groups.PutJoinedGroupsSnapshot(ctx, infos, time.Now())
 		if err != nil {
 			cli.Log.Warnf("Failed to store joined groups snapshot: %v", err)
+		} else {
+			for _, info := range infos {
+				if info != nil && (info.ParticipantCount == 0 || len(info.Participants) == info.ParticipantCount) {
+					cli.clearGroupPermissionDirty(info.JID)
+				}
+			}
 		}
 	}
 	return infos, nil
@@ -744,6 +750,8 @@ func (cli *Client) getGroupInfoWithSnapshotRequirement(ctx context.Context, jid 
 				return groupInfo, fmt.Errorf("failed to store group info snapshot for %s: %w", jid, err)
 			}
 			cli.Log.Warnf("Failed to store group info snapshot for %s: %v", jid, err)
+		} else if requireCompleteSnapshot {
+			cli.clearGroupPermissionDirty(jid)
 		}
 	} else if requireCompleteSnapshot {
 		return groupInfo, fmt.Errorf("group store is nil")

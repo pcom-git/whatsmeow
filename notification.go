@@ -554,8 +554,21 @@ func (cli *Client) handleNotification(ctx context.Context, node *waBinary.Node) 
 				switch groupEvt := evt.(type) {
 				case *events.JoinedGroup:
 					err = cli.Store.Groups.PutGroupInfoSnapshot(ctx, &groupEvt.GroupInfo, time.Now())
+					if err == nil {
+						cli.clearGroupPermissionDirty(groupEvt.JID)
+					} else {
+						cli.markGroupPermissionDirty(groupEvt.JID)
+					}
 				case *events.GroupInfo:
+					affectsPermission := groupInfoEventAffectsSendPermission(groupEvt)
+					wasDirty := false
+					if affectsPermission {
+						wasDirty = cli.beginGroupPermissionUpdate(groupEvt.JID)
+					}
 					err = cli.Store.Groups.PutGroupInfoEvent(ctx, groupInfoEventToStore(groupEvt))
+					if affectsPermission {
+						cli.finishGroupPermissionUpdate(groupEvt.JID, wasDirty, err == nil)
+					}
 				}
 				if err != nil {
 					cli.Log.Warnf("Failed to store group notification data: %v", err)

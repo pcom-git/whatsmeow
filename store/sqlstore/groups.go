@@ -32,6 +32,7 @@ const (
 )
 
 var _ store.GroupStore = (*SQLStore)(nil)
+var _ store.GroupPermissionStore = (*SQLStore)(nil)
 
 const (
 	upsertGroupQuery = `
@@ -134,14 +135,6 @@ const (
 		), updated_at=$3
 		WHERE our_jid=$1 AND group_jid=$2
 	`
-	setGroupMemberAdminQuery = `
-		UPDATE whatsmeow_group_members
-		SET is_admin=$4,
-			is_super_admin=CASE WHEN $4 THEN is_super_admin ELSE false END,
-			participant_version_id=$5,
-			updated_at=$6
-		WHERE our_jid=$1 AND group_jid=$2 AND member_jid=$3
-	`
 	updateGroupNameQuery = `
 		UPDATE whatsmeow_groups SET name=$3, updated_at=$4 WHERE our_jid=$1 AND group_jid=$2
 	`
@@ -153,7 +146,7 @@ const (
 	`
 	updateGroupAnnounceQuery = `
 		UPDATE whatsmeow_groups
-		SET is_announce=$3, participant_version_id=$4, updated_at=$5
+		SET is_announce=$3, updated_at=$4
 		WHERE our_jid=$1 AND group_jid=$2
 	`
 	updateGroupEphemeralQuery = `
@@ -205,6 +198,39 @@ const (
 	`
 	getGroupQuery = groupListSelect + `
 		WHERE g.our_jid=$1 AND g.group_jid=$2 AND g.is_deleted=false
+	`
+	getGroupSendPermissionQuery = `
+		WITH matching_members AS (
+			SELECT is_admin, is_super_admin
+			FROM whatsmeow_group_members
+			WHERE our_jid=$1 AND group_jid=$2 AND status='active'
+			  AND (
+				($3 <> '' AND member_jid=$3) OR
+				($4 <> '' AND member_jid=$4)
+			  )
+		), owner_match AS (
+			SELECT CASE WHEN
+				($3 <> '' AND (COALESCE(owner_jid, '')=$3 OR COALESCE(owner_pn, '')=$3)) OR
+				($4 <> '' AND (COALESCE(owner_jid, '')=$4 OR COALESCE(owner_pn, '')=$4))
+			THEN true ELSE false END AS matched
+			FROM whatsmeow_groups
+			WHERE our_jid=$1 AND group_jid=$2
+		)
+		SELECT
+			g.is_joined,
+			g.is_deleted,
+			g.is_announce,
+			g.suspended,
+			g.last_sync_at,
+			((SELECT matched FROM owner_match) OR EXISTS(SELECT 1 FROM matching_members)),
+			((SELECT matched FROM owner_match) OR EXISTS(
+				SELECT 1 FROM matching_members WHERE is_admin=true OR is_super_admin=true
+			)),
+			((SELECT matched FROM owner_match) OR EXISTS(
+				SELECT 1 FROM matching_members WHERE is_super_admin=true
+			))
+		FROM whatsmeow_groups g
+		WHERE g.our_jid=$1 AND g.group_jid=$2
 	`
 )
 
@@ -564,6 +590,156 @@ func sameParticipantJID(member types.JID, sender, senderPN *types.JID) bool {
 	return senderPN != nil && member.ToNonAD() == senderPN.ToNonAD()
 }
 
+func (s *SQLStore) resolveGroupMemberAliases(ctx context.Context, member types.JID) (types.GroupParticipant, []string, error) {
+	member = member.ToNonAD()
+	participant := groupParticipantFromJID(member)
+	aliases := make([]string, 0, 2)
+	seen := make(map[string]struct{}, 2)
+	addAlias := func(jid types.JID) {
+		value := jidString(jid)
+		if value == "" {
+			return
+		}
+		if _, ok := seen[value]; ok {
+			return
+		}
+		seen[value] = struct{}{}
+		aliases = append(aliases, value)
+	}
+	addAlias(member)
+
+	if s.LIDMap == nil {
+		return participant, aliases, nil
+	}
+	switch member.Server {
+	case types.DefaultUserServer:
+		lid, err := s.LIDMap.GetLIDForPN(ctx, member)
+		if err != nil {
+			return participant, nil, err
+		}
+		if !lid.IsEmpty() {
+			participant.LID = lid.ToNonAD()
+			addAlias(participant.LID)
+		}
+	case types.HiddenUserServer:
+		pn, err := s.LIDMap.GetPNForLID(ctx, member)
+		if err != nil {
+			return participant, nil, err
+		}
+		if !pn.IsEmpty() {
+			participant.PhoneNumber = pn.ToNonAD()
+			addAlias(participant.PhoneNumber)
+		}
+	}
+	return participant, aliases, nil
+}
+
+func groupMemberAliasCondition(start int, aliases []string) string {
+	return "member_jid IN (" + strings.Join(sqlPlaceholders(start, len(aliases)), ",") + ")"
+}
+
+func (s *SQLStore) reactivateGroupMemberAliases(
+	ctx context.Context,
+	groupJID types.JID,
+	participant types.GroupParticipant,
+	aliases []string,
+	versionID string,
+	eventTime time.Time,
+	resetAdmin bool,
+) error {
+	if len(aliases) == 0 {
+		return nil
+	}
+	ts := groupEventUnix(eventTime)
+	args := []any{
+		s.JID,
+		jidString(groupJID),
+		jidDBValue(participant.PhoneNumber),
+		jidDBValue(participant.LID),
+		ts,
+		versionID,
+		resetAdmin,
+	}
+	for _, alias := range aliases {
+		args = append(args, alias)
+	}
+	result, err := s.db.Exec(ctx, `
+		UPDATE whatsmeow_group_members
+		SET phone_number=COALESCE($3, phone_number),
+			lid=COALESCE($4, lid),
+			is_admin=CASE WHEN $7 THEN false ELSE is_admin END,
+			is_super_admin=CASE WHEN $7 THEN false ELSE is_super_admin END,
+			status='active',
+			joined_at=CASE WHEN joined_at=0 OR status<>'active' THEN $5 ELSE joined_at END,
+			left_at=0,
+			participant_version_id=$6,
+			updated_at=$5
+		WHERE our_jid=$1 AND group_jid=$2 AND `+groupMemberAliasCondition(8, aliases), args...)
+	if err != nil {
+		return err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rowsAffected == 0 {
+		return s.upsertActiveGroupMember(ctx, groupJID, participant, versionID, eventTime)
+	}
+	return nil
+}
+
+func (s *SQLStore) setGroupMemberAdminAliases(
+	ctx context.Context,
+	groupJID types.JID,
+	aliases []string,
+	isAdmin bool,
+	versionID string,
+	eventTime time.Time,
+) error {
+	if len(aliases) == 0 {
+		return nil
+	}
+	ts := groupEventUnix(eventTime)
+	args := []any{s.JID, jidString(groupJID), isAdmin, versionID, ts}
+	for _, alias := range aliases {
+		args = append(args, alias)
+	}
+	_, err := s.db.Exec(ctx, `
+		UPDATE whatsmeow_group_members
+		SET is_admin=$3,
+			is_super_admin=CASE WHEN $3 THEN is_super_admin ELSE false END,
+			participant_version_id=$4,
+			updated_at=$5
+		WHERE our_jid=$1 AND group_jid=$2 AND `+groupMemberAliasCondition(6, aliases), args...)
+	return err
+}
+
+func (s *SQLStore) deactivateGroupMemberAliases(
+	ctx context.Context,
+	groupJID types.JID,
+	aliases []string,
+	status string,
+	versionID string,
+	eventTime time.Time,
+) (int64, error) {
+	if len(aliases) == 0 {
+		return 0, nil
+	}
+	ts := groupEventUnix(eventTime)
+	args := []any{s.JID, jidString(groupJID), status, ts, versionID}
+	for _, alias := range aliases {
+		args = append(args, alias)
+	}
+	result, err := s.db.Exec(ctx, `
+		UPDATE whatsmeow_group_members
+		SET status=$3, left_at=$4, participant_version_id=$5, updated_at=$4
+		WHERE our_jid=$1 AND group_jid=$2 AND `+groupMemberAliasCondition(6, aliases), args...)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 func (s *SQLStore) PutGroupInfoEvent(ctx context.Context, evt *store.GroupInfoEvent) error {
 	if evt == nil || evt.JID.IsEmpty() {
 		return nil
@@ -591,7 +767,7 @@ func (s *SQLStore) PutGroupInfoEvent(ctx context.Context, evt *store.GroupInfoEv
 			}
 		}
 		if evt.Announce != nil {
-			if _, err := s.db.Exec(ctx, updateGroupAnnounceQuery, s.JID, groupID, evt.Announce.IsAnnounce, evt.Announce.AnnounceVersionID, ts); err != nil {
+			if _, err := s.db.Exec(ctx, updateGroupAnnounceQuery, s.JID, groupID, evt.Announce.IsAnnounce, ts); err != nil {
 				return err
 			}
 		}
@@ -618,7 +794,11 @@ func (s *SQLStore) PutGroupInfoEvent(ctx context.Context, evt *store.GroupInfoEv
 
 		participantChanged := len(evt.Join) > 0 || len(evt.Leave) > 0
 		for _, member := range evt.Join {
-			if err := s.upsertActiveGroupMember(ctx, evt.JID, groupParticipantFromJID(member), evt.ParticipantVersionID, evt.Timestamp); err != nil {
+			participant, aliases, err := s.resolveGroupMemberAliases(ctx, member)
+			if err != nil {
+				return err
+			}
+			if err = s.reactivateGroupMemberAliases(ctx, evt.JID, participant, aliases, evt.ParticipantVersionID, evt.Timestamp, true); err != nil {
 				return err
 			}
 		}
@@ -627,23 +807,41 @@ func (s *SQLStore) PutGroupInfoEvent(ctx context.Context, evt *store.GroupInfoEv
 			if sameParticipantJID(member, evt.Sender, evt.SenderPN) {
 				status = groupMemberStatusLeft
 			}
-			if err := s.upsertInactiveGroupMember(ctx, evt.JID, member, status, evt.ParticipantVersionID, evt.Timestamp); err != nil {
+			participant, aliases, err := s.resolveGroupMemberAliases(ctx, member)
+			if err != nil {
 				return err
+			}
+			rowsAffected, err := s.deactivateGroupMemberAliases(ctx, evt.JID, aliases, status, evt.ParticipantVersionID, evt.Timestamp)
+			if err != nil {
+				return err
+			}
+			if rowsAffected == 0 {
+				if err = s.upsertInactiveGroupMember(ctx, evt.JID, participant.JID, status, evt.ParticipantVersionID, evt.Timestamp); err != nil {
+					return err
+				}
 			}
 		}
 		for _, member := range evt.Promote {
-			if err := s.upsertActiveGroupMember(ctx, evt.JID, groupParticipantFromJID(member), evt.ParticipantVersionID, evt.Timestamp); err != nil {
+			participant, aliases, err := s.resolveGroupMemberAliases(ctx, member)
+			if err != nil {
 				return err
 			}
-			if _, err := s.db.Exec(ctx, setGroupMemberAdminQuery, s.JID, groupID, jidString(member), true, evt.ParticipantVersionID, ts); err != nil {
+			if err = s.reactivateGroupMemberAliases(ctx, evt.JID, participant, aliases, evt.ParticipantVersionID, evt.Timestamp, false); err != nil {
+				return err
+			}
+			if err = s.setGroupMemberAdminAliases(ctx, evt.JID, aliases, true, evt.ParticipantVersionID, evt.Timestamp); err != nil {
 				return err
 			}
 		}
 		for _, member := range evt.Demote {
-			if err := s.upsertActiveGroupMember(ctx, evt.JID, groupParticipantFromJID(member), evt.ParticipantVersionID, evt.Timestamp); err != nil {
+			participant, aliases, err := s.resolveGroupMemberAliases(ctx, member)
+			if err != nil {
 				return err
 			}
-			if _, err := s.db.Exec(ctx, setGroupMemberAdminQuery, s.JID, groupID, jidString(member), false, evt.ParticipantVersionID, ts); err != nil {
+			if err = s.reactivateGroupMemberAliases(ctx, evt.JID, participant, aliases, evt.ParticipantVersionID, evt.Timestamp, false); err != nil {
+				return err
+			}
+			if err = s.setGroupMemberAdminAliases(ctx, evt.JID, aliases, false, evt.ParticipantVersionID, evt.Timestamp); err != nil {
 				return err
 			}
 		}
@@ -757,6 +955,56 @@ func (s *SQLStore) GetGroup(ctx context.Context, groupJID types.JID) (*store.Gro
 		return nil, err
 	}
 	return &entry, nil
+}
+
+// GetGroupSendPermission reads the current account's group posting permission
+// exclusively from the local group projection. It never performs a network
+// request or refreshes the stored snapshot.
+func (s *SQLStore) GetGroupSendPermission(ctx context.Context, groupJID, ownPN, ownLID types.JID) (*store.GroupSendPermission, error) {
+	permission := &store.GroupSendPermission{}
+	if groupJID.IsEmpty() {
+		return permission, nil
+	}
+
+	ownPNString := jidString(ownPN)
+	ownLIDString := jidString(ownLID)
+	var (
+		isJoined  bool
+		isDeleted bool
+		lastSync  int64
+	)
+	err := s.db.QueryRow(
+		ctx,
+		getGroupSendPermissionQuery,
+		s.JID,
+		jidString(groupJID),
+		ownPNString,
+		ownLIDString,
+	).Scan(
+		&isJoined,
+		&isDeleted,
+		&permission.IsAnnounce,
+		&permission.Suspended,
+		&lastSync,
+		&permission.IsMember,
+		&permission.IsAdmin,
+		&permission.IsSuperAdmin,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return permission, nil
+	} else if err != nil {
+		return nil, err
+	}
+
+	permission.IsJoined = isJoined && !isDeleted
+	if lastSync > 0 {
+		permission.LastSyncAt = time.Unix(lastSync, 0)
+	}
+	permission.StateKnown = lastSync > 0
+	if permission.IsAnnounce && permission.IsJoined && !permission.IsMember {
+		permission.StateKnown = false
+	}
+	return permission, nil
 }
 
 // groupMemberListResolvedSelect resolves the phone number and LID identities for

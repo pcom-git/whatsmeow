@@ -151,6 +151,8 @@ type Client struct {
 
 	groupCache           map[types.JID]*groupMetaCache
 	groupCacheLock       sync.Mutex
+	groupPermissionDirty map[types.JID]struct{}
+	groupPermissionLock  sync.RWMutex
 	userDevicesCache     map[types.JID]deviceCache
 	userDevicesCacheLock sync.Mutex
 
@@ -283,9 +285,10 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 
 		historySyncNotifications: make(chan *waE2E.HistorySyncNotification, 32),
 
-		tcTokenSenderTS:  make(map[types.JID]time.Time),
-		groupCache:       make(map[types.JID]*groupMetaCache),
-		userDevicesCache: make(map[types.JID]deviceCache),
+		tcTokenSenderTS:      make(map[types.JID]time.Time),
+		groupCache:           make(map[types.JID]*groupMetaCache),
+		groupPermissionDirty: make(map[types.JID]struct{}),
+		userDevicesCache:     make(map[types.JID]deviceCache),
 
 		recentMessagesMap:      make(map[recentMessageKey]RecentMessage, recentMessagesSize),
 		sessionRecreateHistory: make(map[types.JID]time.Time),
