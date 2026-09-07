@@ -17,6 +17,7 @@ import (
 	"io"
 	"runtime/debug"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -40,6 +41,30 @@ import (
 
 var pbSerializer = store.SignalProtobufSerializer
 
+func messageNodeChildTagSummary(node *waBinary.Node) string {
+	children := node.GetChildren()
+	if len(children) == 0 {
+		return ""
+	}
+	counts := make(map[string]int, len(children))
+	order := make([]string, 0, len(children))
+	for _, child := range children {
+		if counts[child.Tag] == 0 {
+			order = append(order, child.Tag)
+		}
+		counts[child.Tag]++
+	}
+	parts := make([]string, 0, len(order))
+	for _, tag := range order {
+		if counts[tag] == 1 {
+			parts = append(parts, tag)
+		} else {
+			parts = append(parts, fmt.Sprintf("%s:%d", tag, counts[tag]))
+		}
+	}
+	return strings.Join(parts, ",")
+}
+
 func (cli *Client) handleEncryptedMessage(ctx context.Context, node *waBinary.Node) {
 	info, err := cli.parseMessageInfo(node)
 	if err != nil {
@@ -47,6 +72,16 @@ func (cli *Client) handleEncryptedMessage(ctx context.Context, node *waBinary.No
 		cli.sendAck(ctx, node, NackParsingError)
 		return
 	}
+	_, hasUnavailable := node.GetOptionalChildByTag("unavailable")
+	_, hasPlaintext := node.GetOptionalChildByTag("plaintext")
+	_, hasMeta := node.GetOptionalChildByTag("meta")
+	encCount := len(node.GetChildrenByTag("enc"))
+	childTags := messageNodeChildTagSummary(node)
+	cli.Log.Debugf(
+		"Received message node %s id=%s source=%s type=%q category=%q push_name_present=%t sender_alt=%s recipient_alt=%s enc_count=%d has_unavailable=%t has_plaintext=%t has_meta=%t child_tags=%q",
+		node.Tag, info.ID, info.SourceString(), info.Type, info.Category, len(info.PushName) > 0, info.SenderAlt, info.RecipientAlt,
+		encCount, hasUnavailable, hasPlaintext, hasMeta, childTags,
+	)
 	if !info.SenderAlt.IsEmpty() {
 		cli.StoreLIDPNMapping(ctx, info.SenderAlt, info.Sender)
 	} else if !info.RecipientAlt.IsEmpty() {
@@ -56,6 +91,7 @@ func (cli *Client) handleEncryptedMessage(ctx context.Context, node *waBinary.No
 		go cli.updateBusinessName(ctx, info.Sender, info.SenderAlt, info, info.VerifiedName.Details.GetVerifiedName())
 	}
 	if len(info.PushName) > 0 && info.PushName != "-" && (cli.MessengerConfig == nil || info.PushName != "username") {
+		cli.Log.Debugf("Message %s carries push name update for %s alt=%s push_name=%q", info.ID, info.Sender, info.SenderAlt, info.PushName)
 		go cli.updatePushName(ctx, info.Sender, info.SenderAlt, info, info.PushName)
 	}
 	if info.Sender.Server == types.NewsletterServer {
@@ -895,6 +931,10 @@ func (cli *Client) handlePlaceholderResendResponse(msg *waE2E.PeerDataOperationR
 		} else if msgEvt, err := cli.ParseWebMessage(types.EmptyJID, &webMsg); err != nil {
 			cli.Log.Warnf("Failed to parse web message info in item #%d of response to %s: %v", i+1, reqID, err)
 		} else {
+			cli.Log.Debugf(
+				"Placeholder resend response %s item #%d produced message id=%s source=%s timestamp=%s type=%q media_type=%q",
+				reqID, i+1, msgEvt.Info.ID, msgEvt.Info.SourceString(), msgEvt.Info.Timestamp.Format(time.RFC3339), msgEvt.Info.Type, msgEvt.Info.MediaType,
+			)
 			msgEvt.UnavailableRequestID = reqID
 			ok = !cli.dispatchMessageEvent(msgEvt) && ok
 		}
@@ -935,6 +975,7 @@ func (cli *Client) handleProtocolMessage(ctx context.Context, info *types.Messag
 		peerResp := protoMsg.GetPeerDataOperationRequestResponseMessage()
 		switch peerResp.GetPeerDataOperationRequestType() {
 		case waE2E.PeerDataOperationRequestType_PLACEHOLDER_MESSAGE_RESEND:
+			cli.Log.Debugf("Received placeholder resend response protocol message id=%s request_id=%s parts=%d source=%s", info.ID, peerResp.GetStanzaID(), len(peerResp.GetPeerDataOperationResult()), info.SourceString())
 			ok = cli.handlePlaceholderResendResponse(peerResp) && ok
 		case waE2E.PeerDataOperationRequestType_COMPANION_SYNCD_SNAPSHOT_FATAL_RECOVERY:
 			ok = cli.handleAppStateRecovery(ctx, peerResp.GetStanzaID(), peerResp.GetPeerDataOperationResult()) && ok

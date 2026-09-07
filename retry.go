@@ -621,6 +621,7 @@ var RequestFromPhoneDelay = 5 * time.Second
 func (cli *Client) delayedRequestMessageFromPhone(info *types.MessageInfo) {
 	ctx, cancel, reserved := cli.preparePhoneRerequest(info, 0)
 	if reserved {
+		cli.Log.Debugf("Scheduled delayed phone rerequest for message %s from %s after %s", info.ID, info.SourceString(), RequestFromPhoneDelay)
 		cli.waitForPhoneRerequest(ctx, cancel, info, 0)
 	}
 }
@@ -655,11 +656,16 @@ func (cli *Client) finishPhoneRerequest(info *types.MessageInfo, retryCount int,
 
 func (cli *Client) preparePhoneRerequest(info *types.MessageInfo, retryCount int) (context.Context, context.CancelFunc, bool) {
 	if !cli.AutomaticMessageRerequestFromPhone || cli.MessengerConfig != nil {
+		cli.Log.Debugf(
+			"Skipping phone rerequest reservation for message %s from %s: automatic=%t messenger_config_present=%t retry_count=%d",
+			info.ID, info.SourceString(), cli.AutomaticMessageRerequestFromPhone, cli.MessengerConfig != nil, retryCount,
+		)
 		return nil, nil, false
 	}
 	ctx, cancel := context.WithCancel(cli.BackgroundEventCtx)
 	previousCancel, reserved := cli.reservePhoneRerequest(info, retryCount, cancel, ctx.Done())
 	if !reserved {
+		cli.Log.Debugf("Skipping duplicate phone rerequest for message %s from %s retry_count=%d", info.ID, info.SourceString(), retryCount)
 		cancel()
 		return nil, nil, false
 	}
@@ -677,7 +683,7 @@ func (cli *Client) waitForPhoneRerequest(ctx context.Context, cancel context.Can
 	select {
 	case <-timer.C:
 	case <-ctx.Done():
-		cli.Log.Debugf("Cancelled delayed request for message %s from phone", info.ID)
+		cli.Log.Debugf("Cancelled delayed request for message %s from phone source=%s retry_count=%d", info.ID, info.SourceString(), retryCount)
 		return
 	}
 	cli.immediateRequestMessageFromPhone(ctx, info)
@@ -685,31 +691,39 @@ func (cli *Client) waitForPhoneRerequest(ctx context.Context, cancel context.Can
 
 func (cli *Client) schedulePhoneRerequest(ctx context.Context, info *types.MessageInfo, retryCount int) {
 	if !cli.AutomaticMessageRerequestFromPhone || cli.MessengerConfig != nil {
+		cli.Log.Debugf(
+			"Skipping phone rerequest schedule for message %s from %s: automatic=%t messenger_config_present=%t retry_count=%d",
+			info.ID, info.SourceString(), cli.AutomaticMessageRerequestFromPhone, cli.MessengerConfig != nil, retryCount,
+		)
 		return
 	}
 	if cli.SynchronousAck {
 		previousCancel, reserved := cli.reservePhoneRerequest(info, retryCount, nil, nil)
 		if !reserved {
+			cli.Log.Debugf("Skipping duplicate synchronous phone rerequest for message %s from %s retry_count=%d", info.ID, info.SourceString(), retryCount)
 			return
 		}
 		if previousCancel != nil {
 			previousCancel()
 		}
+		cli.Log.Debugf("Sending synchronous phone rerequest for message %s from %s retry_count=%d", info.ID, info.SourceString(), retryCount)
 		cli.immediateRequestMessageFromPhone(ctx, info)
 	} else {
 		phoneCtx, cancel, reserved := cli.preparePhoneRerequest(info, retryCount)
 		if reserved {
+			cli.Log.Debugf("Scheduling async phone rerequest for message %s from %s retry_count=%d after %s", info.ID, info.SourceString(), retryCount, RequestFromPhoneDelay)
 			go cli.waitForPhoneRerequest(phoneCtx, cancel, info, retryCount)
 		}
 	}
 }
 
 func (cli *Client) immediateRequestMessageFromPhone(ctx context.Context, info *types.MessageInfo) {
-	_, err := cli.SendPeerMessage(ctx, cli.BuildUnavailableMessageRequest(info.Chat, info.Sender, info.ID))
+	cli.Log.Debugf("Sending placeholder resend request for unavailable message %s chat=%s sender=%s source=%s", info.ID, info.Chat, info.Sender, info.SourceString())
+	resp, err := cli.SendPeerMessage(ctx, cli.BuildUnavailableMessageRequest(info.Chat, info.Sender, info.ID))
 	if err != nil {
-		cli.Log.Warnf("Failed to send request for unavailable message %s to phone: %v", info.ID, err)
+		cli.Log.Warnf("Failed to send request for unavailable message %s to phone chat=%s sender=%s: %v", info.ID, info.Chat, info.Sender, err)
 	} else {
-		cli.Log.Debugf("Requested message %s from phone", info.ID)
+		cli.Log.Debugf("Requested message %s from phone with request_id=%s request_timestamp=%s", info.ID, resp.ID, resp.Timestamp.Format(time.RFC3339))
 	}
 	return
 }
