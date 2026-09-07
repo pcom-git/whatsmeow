@@ -159,6 +159,13 @@ func addContactPhoneJIDUser(phone string) string {
 	return phone
 }
 
+func addContactPhoneQueryValue(phone string) string {
+	if phone == "" || strings.HasPrefix(phone, "+") {
+		return phone
+	}
+	return "+" + phone
+}
+
 func normalizeAddContactUsername(username string) string {
 	return strings.TrimPrefix(strings.TrimSpace(username), "@")
 }
@@ -273,7 +280,7 @@ func buildPhoneAddContactUSyncNode(requestID, phone, mode string) waBinary.Node 
 			{Tag: "query", Content: query},
 			{Tag: "list", Content: []waBinary.Node{{
 				Tag:     "user",
-				Content: []waBinary.Node{{Tag: "contact", Content: phone}},
+				Content: []waBinary.Node{{Tag: "contact", Content: addContactPhoneQueryValue(phone)}},
 			}}},
 		},
 	}
