@@ -48,6 +48,10 @@ func (cli *Client) fetchAppState(ctx context.Context, name appstate.WAPatchName,
 	}
 	cli.appStateSyncLock.Lock()
 	defer cli.appStateSyncLock.Unlock()
+	return cli.fetchAppStateLocked(ctx, name, fullSync, onlyIfNotSynced)
+}
+
+func (cli *Client) fetchAppStateLocked(ctx context.Context, name appstate.WAPatchName, fullSync, onlyIfNotSynced bool) ([]any, error) {
 	if fullSync {
 		err := cli.Store.AppState.DeleteAppStateVersion(ctx, string(name))
 		if err != nil {
@@ -663,11 +667,21 @@ func (cli *Client) requestAppStateKeys(ctx context.Context, rawKeyIDs [][]byte) 
 //
 //	cli.SendAppState(ctx, appstate.BuildMute(targetJID, true, 24 * time.Hour))
 func (cli *Client) SendAppState(ctx context.Context, patch appstate.PatchInfo) error {
+	if cli == nil {
+		return ErrClientIsNil
+	}
+	cli.appStateSyncLock.Lock()
+	defer cli.appStateSyncLock.Unlock()
 	return cli.sendAppState(ctx, patch, true)
 }
 
 // SetChatNote updates the current user's note for the given chat.
 func (cli *Client) SetChatNote(ctx context.Context, target types.JID, note string) error {
+	if cli == nil {
+		return ErrClientIsNil
+	}
+	cli.appStateSyncLock.Lock()
+	defer cli.appStateSyncLock.Unlock()
 	return cli.sendChatNoteAppState(ctx, appstate.BuildNoteEdit(target, note), true)
 }
 
@@ -750,7 +764,7 @@ func (cli *Client) sendAppState(ctx context.Context, patch appstate.PatchInfo, a
 		}
 		return mainErr
 	}
-	eventsToDispatch, err := cli.fetchAppState(ctx, patch.Type, false, false)
+	eventsToDispatch, err := cli.fetchAppStateLocked(ctx, patch.Type, false, false)
 	if err != nil {
 		return fmt.Errorf("failed to fetch app state after sending update: %w", err)
 	}
@@ -843,7 +857,7 @@ func (cli *Client) sendChatNoteAppState(ctx context.Context, patch appstate.Patc
 		}
 		return mainErr
 	}
-	eventsToDispatch, err := cli.fetchAppState(ctx, patch.Type, false, false)
+	eventsToDispatch, err := cli.fetchAppStateLocked(ctx, patch.Type, false, false)
 	if err != nil {
 		return fmt.Errorf("failed to fetch app state after sending update: %w", err)
 	}
