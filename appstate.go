@@ -254,31 +254,39 @@ func contactActionLIDMapping(indexJID types.JID, act *waSyncAction.ContactAction
 	return store.LIDMapping{LID: lid, PN: pn}, true
 }
 
+func contactActionIsAddContact(act *waSyncAction.ContactAction) bool {
+	if act == nil || act.SaveOnPrimaryAddressbook == nil {
+		return true
+	}
+	return act.GetSaveOnPrimaryAddressbook()
+}
+
 func (cli *Client) filterContacts(mutations []appstate.Mutation) ([]appstate.Mutation, []store.ContactEntry, []store.LIDMapping) {
 	filteredMutations := mutations[:0]
 	contacts := make([]store.ContactEntry, 0, len(mutations))
 	lidMappings := make([]store.LIDMapping, 0, len(mutations))
 	for _, mutation := range mutations {
-		if mutation.Index[0] == "contact" && len(mutation.Index) > 1 {
+		if mutation.Index[0] == appstate.IndexContact && len(mutation.Index) > 1 {
 			jid, _ := types.ParseJID(mutation.Index[1])
 			act := mutation.Action.GetContactAction()
+			isAddContact := mutation.Operation == waServerSync.SyncdMutation_SET && contactActionIsAddContact(act)
 			contacts = append(contacts, store.ContactEntry{
 				JID:          jid,
 				FirstName:    act.GetFirstName(),
 				FullName:     act.GetFullName(),
-				IsAddContact: true,
+				IsAddContact: isAddContact,
 			})
 			if mapping, ok := contactActionLIDMapping(jid, act); ok {
 				lidMappings = append(lidMappings, mapping)
 			}
-		} else if mutation.Index[0] == "lid_contact" && len(mutation.Index) > 1 {
+		} else if mutation.Index[0] == appstate.IndexLIDContact && len(mutation.Index) > 1 {
 			jid, _ := types.ParseJID(mutation.Index[1])
 			act := mutation.Action.GetLidContactAction()
 			contacts = append(contacts, store.ContactEntry{
 				JID:          jid,
 				FirstName:    act.GetFirstName(),
 				FullName:     act.GetFullName(),
-				IsAddContact: true,
+				IsAddContact: mutation.Operation == waServerSync.SyncdMutation_SET,
 			})
 		} else {
 			filteredMutations = append(filteredMutations, mutation)
@@ -319,7 +327,8 @@ func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchNa
 		return
 	}
 
-	if mutation.Operation != waServerSync.SyncdMutation_SET {
+	if mutation.Operation != waServerSync.SyncdMutation_SET &&
+		(len(mutation.Index) == 0 || (mutation.Index[0] != appstate.IndexContact && mutation.Index[0] != appstate.IndexLIDContact)) {
 		return
 	}
 
@@ -361,7 +370,8 @@ func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchNa
 		act := mutation.Action.GetContactAction()
 		eventToDispatch = &events.Contact{JID: jid, Timestamp: ts, Action: act, FromFullSync: fullSync}
 		if cli.Store.Contacts != nil {
-			storeUpdateError = cli.Store.Contacts.PutContactName(ctx, jid, act.GetFirstName(), act.GetFullName(), true)
+			isAddContact := mutation.Operation == waServerSync.SyncdMutation_SET && contactActionIsAddContact(act)
+			storeUpdateError = cli.Store.Contacts.PutContactName(ctx, jid, act.GetFirstName(), act.GetFullName(), isAddContact)
 		}
 		if cli.Store.LIDs != nil {
 			if mapping, ok := contactActionLIDMapping(jid, act); ok {
@@ -381,7 +391,7 @@ func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchNa
 		}
 		eventToDispatch = &events.Contact{JID: jid, Timestamp: ts, Action: contactAction, FromFullSync: fullSync}
 		if cli.Store.Contacts != nil {
-			storeUpdateError = cli.Store.Contacts.PutContactName(ctx, jid, act.GetFirstName(), act.GetFullName(), true)
+			storeUpdateError = cli.Store.Contacts.PutContactName(ctx, jid, act.GetFirstName(), act.GetFullName(), mutation.Operation == waServerSync.SyncdMutation_SET)
 		}
 	case appstate.IndexClearChat:
 		act := mutation.Action.GetClearChatAction()
