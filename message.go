@@ -928,7 +928,9 @@ func (cli *Client) handleAppStateSyncKeyShare(ctx context.Context, keys *waE2E.A
 	cli.Log.Debugf("Got %d new app state keys", len(keys.GetKeys()))
 	cli.appStateKeyRequestsLock.RLock()
 	for _, key := range keys.GetKeys() {
-		entry := classifyAppStateSyncKeyShareKey(key)
+		keyID := key.GetKeyID().GetKeyID()
+		_, alreadyRequested := cli.appStateKeyRequests[hex.EncodeToString(keyID)]
+		entry := classifyAppStateSyncKeyShareKey(key, alreadyRequested)
 		if !entry.valid {
 			if len(entry.keyID) == 0 {
 				cli.Log.Warnf("Ignoring app state sync key share without key ID")
@@ -965,7 +967,7 @@ func (cli *Client) handleAppStateSyncKeyShare(ctx context.Context, keys *waE2E.A
 	cli.appStateKeyRequestsLock.RUnlock()
 
 	if len(keyIDsToRequest) > 0 {
-		cli.requestAppStateKeys(ctx, keyIDsToRequest)
+		cli.requestAppStateKeysOnce(ctx, keyIDsToRequest)
 	}
 	if !storedAnyKeys {
 		return
@@ -986,18 +988,35 @@ type appStateSyncKeyShareEntry struct {
 	retry   bool
 }
 
-func classifyAppStateSyncKeyShareKey(key *waE2E.AppStateSyncKey) appStateSyncKeyShareEntry {
+func classifyAppStateSyncKeyShareKey(key *waE2E.AppStateSyncKey, alreadyRequested bool) appStateSyncKeyShareEntry {
 	entry := appStateSyncKeyShareEntry{keyID: key.GetKeyID().GetKeyID()}
 	if len(entry.keyID) == 0 {
 		return entry
 	}
 	entry.keyData = key.GetKeyData()
 	if entry.keyData == nil || len(entry.keyData.GetKeyData()) == 0 || entry.keyData.GetFingerprint() == nil {
-		entry.retry = true
+		entry.retry = !alreadyRequested
 		return entry
 	}
 	entry.valid = true
 	return entry
+}
+
+func (cli *Client) requestAppStateKeysOnce(ctx context.Context, rawKeyIDs [][]byte) {
+	cli.appStateKeyRequestsLock.Lock()
+	keyIDsToRequest := make([][]byte, 0, len(rawKeyIDs))
+	now := time.Now()
+	for _, keyID := range rawKeyIDs {
+		stringKeyID := hex.EncodeToString(keyID)
+		if _, alreadyRequested := cli.appStateKeyRequests[stringKeyID]; alreadyRequested {
+			continue
+		}
+		cli.appStateKeyRequests[stringKeyID] = now
+		keyIDsToRequest = append(keyIDsToRequest, keyID)
+	}
+	cli.appStateKeyRequestsLock.Unlock()
+
+	cli.requestAppStateKeys(ctx, keyIDsToRequest)
 }
 
 func (cli *Client) handlePlaceholderResendResponse(msg *waE2E.PeerDataOperationRequestResponseMessage) (ok bool) {
