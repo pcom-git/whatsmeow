@@ -922,31 +922,54 @@ func (cli *Client) DownloadHistorySync(ctx context.Context, notif *waE2E.History
 
 func (cli *Client) handleAppStateSyncKeyShare(ctx context.Context, keys *waE2E.AppStateSyncKeyShare) {
 	onlyResyncIfNotSynced := true
+	var keyIDsToRequest [][]byte
+	storedAnyKeys := false
 
 	cli.Log.Debugf("Got %d new app state keys", len(keys.GetKeys()))
 	cli.appStateKeyRequestsLock.RLock()
 	for _, key := range keys.GetKeys() {
-		marshaledFingerprint, err := proto.Marshal(key.GetKeyData().GetFingerprint())
-		if err != nil {
-			cli.Log.Errorf("Failed to marshal fingerprint of app state sync key %X", key.GetKeyID().GetKeyID())
+		entry := classifyAppStateSyncKeyShareKey(key)
+		if !entry.valid {
+			if len(entry.keyID) == 0 {
+				cli.Log.Warnf("Ignoring app state sync key share without key ID")
+			} else if entry.retry {
+				cli.Log.Warnf("Received incomplete app state sync key %X, requesting it again", entry.keyID)
+				keyIDsToRequest = append(keyIDsToRequest, entry.keyID)
+				onlyResyncIfNotSynced = false
+			} else {
+				cli.Log.Warnf("Ignoring incomplete app state sync key %X", entry.keyID)
+			}
 			continue
 		}
-		_, isReRequest := cli.appStateKeyRequests[hex.EncodeToString(key.GetKeyID().GetKeyID())]
+		marshaledFingerprint, err := proto.Marshal(entry.keyData.GetFingerprint())
+		if err != nil {
+			cli.Log.Errorf("Failed to marshal fingerprint of app state sync key %X", entry.keyID)
+			continue
+		}
+		_, isReRequest := cli.appStateKeyRequests[hex.EncodeToString(entry.keyID)]
 		if isReRequest {
 			onlyResyncIfNotSynced = false
 		}
-		err = cli.Store.AppStateKeys.PutAppStateSyncKey(ctx, key.GetKeyID().GetKeyID(), store.AppStateSyncKey{
-			Data:        key.GetKeyData().GetKeyData(),
+		err = cli.Store.AppStateKeys.PutAppStateSyncKey(ctx, entry.keyID, store.AppStateSyncKey{
+			Data:        entry.keyData.GetKeyData(),
 			Fingerprint: marshaledFingerprint,
-			Timestamp:   key.GetKeyData().GetTimestamp(),
+			Timestamp:   entry.keyData.GetTimestamp(),
 		})
 		if err != nil {
-			cli.Log.Errorf("Failed to store app state sync key %X: %v", key.GetKeyID().GetKeyID(), err)
+			cli.Log.Errorf("Failed to store app state sync key %X: %v", entry.keyID, err)
 			continue
 		}
-		cli.Log.Debugf("Received app state sync key %X (ts: %d)", key.GetKeyID().GetKeyID(), key.GetKeyData().GetTimestamp())
+		storedAnyKeys = true
+		cli.Log.Debugf("Received app state sync key %X (ts: %d)", entry.keyID, entry.keyData.GetTimestamp())
 	}
 	cli.appStateKeyRequestsLock.RUnlock()
+
+	if len(keyIDsToRequest) > 0 {
+		cli.requestAppStateKeys(ctx, keyIDsToRequest)
+	}
+	if !storedAnyKeys {
+		return
+	}
 
 	for _, name := range appstate.AllPatchNames {
 		err := cli.FetchAppState(ctx, name, false, onlyResyncIfNotSynced)
@@ -954,6 +977,27 @@ func (cli *Client) handleAppStateSyncKeyShare(ctx context.Context, keys *waE2E.A
 			cli.Log.Errorf("Failed to do initial fetch of app state %s: %v", name, err)
 		}
 	}
+}
+
+type appStateSyncKeyShareEntry struct {
+	keyID   []byte
+	keyData *waE2E.AppStateSyncKeyData
+	valid   bool
+	retry   bool
+}
+
+func classifyAppStateSyncKeyShareKey(key *waE2E.AppStateSyncKey) appStateSyncKeyShareEntry {
+	entry := appStateSyncKeyShareEntry{keyID: key.GetKeyID().GetKeyID()}
+	if len(entry.keyID) == 0 {
+		return entry
+	}
+	entry.keyData = key.GetKeyData()
+	if entry.keyData == nil || len(entry.keyData.GetKeyData()) == 0 || entry.keyData.GetFingerprint() == nil {
+		entry.retry = true
+		return entry
+	}
+	entry.valid = true
+	return entry
 }
 
 func (cli *Client) handlePlaceholderResendResponse(msg *waE2E.PeerDataOperationRequestResponseMessage) (ok bool) {
