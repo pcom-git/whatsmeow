@@ -266,7 +266,9 @@ func (cli *Client) filterContacts(mutations []appstate.Mutation) ([]appstate.Mut
 	contacts := make([]store.ContactEntry, 0, len(mutations))
 	lidMappings := make([]store.LIDMapping, 0, len(mutations))
 	for _, mutation := range mutations {
-		if mutation.Index[0] == appstate.IndexContact && len(mutation.Index) > 1 {
+		if len(mutation.Index) == 0 {
+			filteredMutations = append(filteredMutations, mutation)
+		} else if mutation.Index[0] == appstate.IndexContact && len(mutation.Index) > 1 {
 			jid, _ := types.ParseJID(mutation.Index[1])
 			act := mutation.Action.GetContactAction()
 			isAddContact := mutation.Operation == waServerSync.SyncdMutation_SET && contactActionIsAddContact(act)
@@ -327,8 +329,12 @@ func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchNa
 		return
 	}
 
+	if len(mutation.Index) == 0 {
+		return
+	}
+
 	if mutation.Operation != waServerSync.SyncdMutation_SET &&
-		(len(mutation.Index) == 0 || (mutation.Index[0] != appstate.IndexContact && mutation.Index[0] != appstate.IndexLIDContact)) {
+		mutation.Index[0] != appstate.IndexContact && mutation.Index[0] != appstate.IndexLIDContact {
 		return
 	}
 
@@ -572,20 +578,28 @@ func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchNa
 			Action:       act,
 			FromFullSync: fullSync,
 		}
-	case appstate.IndexFavorites:
-		act := mutation.Action.GetFavoritesAction()
-		if cli.Store.Labels != nil {
-			favorites := act.GetFavorites()
-			members := make([]types.JID, 0, len(favorites))
-			for _, favorite := range favorites {
-				jid, err := types.ParseJID(favorite.GetID())
-				if err != nil {
-					cli.Log.Warnf("Failed to parse favorites JID %q for label store: %v", favorite.GetID(), err)
-					continue
-				}
-				members = append(members, jid)
+	case appstate.IndexWasaRootSecretAction:
+		if len(mutation.Index) < 2 {
+			return
+		}
+		botJID, _ := types.ParseJID(mutation.Index[1])
+		ownLID := cli.getOwnLID()
+		inputSecrets := mutation.Action.GetWasaRootSecretAction().GetSecrets()
+		ids := make([]string, 0, len(inputSecrets))
+		storeUpdateError = cli.Store.MsgSecrets.PutMessageSecrets(ctx, exslices.CastFunc(inputSecrets, func(secret *waSyncAction.WASARootSecretAction_RootSecretEntry) store.MessageSecretInsert {
+			ids = append(ids, secret.GetID())
+			return store.MessageSecretInsert{
+				Chat:   botJID,
+				Sender: ownLID,
+				ID:     secret.GetID(),
+				Secret: secret.GetRootSecret(),
 			}
-			storeUpdateError = cli.Store.Labels.ReplaceFavoriteMembers(ctx, members, ts, fullSync)
+		}))
+		if storeUpdateError == nil {
+			zerolog.Ctx(ctx).Debug().
+				Strs("ids", ids).
+				Stringer("bot_jid", botJID).
+				Msg("Stored WASA root secrets from app state")
 		}
 	}
 	if storeUpdateError != nil {
@@ -760,7 +774,7 @@ func (cli *Client) sendAppState(ctx context.Context, patch appstate.PatchInfo, a
 			patches, err := appstate.ParsePatchList(ctx, &respCollection, cli.downloadExternalAppStateBlob)
 			if err != nil {
 				return fmt.Errorf("%w (also, parsing patches in the response failed: %w)", mainErr, err)
-			} else if state, err = cli.applyAppStatePatches(ctx, patch.Type, state, patches, false, &eventsToDispatch); err != nil {
+			} else if _, err = cli.applyAppStatePatches(ctx, patch.Type, state, patches, false, &eventsToDispatch); err != nil {
 				return fmt.Errorf("%w (also, applying patches in the response failed: %w)", mainErr, err)
 			} else {
 				zerolog.Ctx(ctx).Debug().Msg("Retrying app state send after applying conflicting patches")

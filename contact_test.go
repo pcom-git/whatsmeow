@@ -100,6 +100,22 @@ func newContactMutation(pn, lid types.JID) appstate.Mutation {
 	}
 }
 
+func TestFilterContactsKeepsMutationWithEmptyIndex(t *testing.T) {
+	cli := &Client{}
+	mutation := appstate.Mutation{Index: nil}
+
+	filtered, contacts, lidMappings := cli.filterContacts([]appstate.Mutation{mutation})
+	if len(filtered) != 1 {
+		t.Fatalf("expected empty-index mutation to remain filtered, got %d mutations", len(filtered))
+	}
+	if len(contacts) != 0 {
+		t.Fatalf("expected no contacts, got %d", len(contacts))
+	}
+	if len(lidMappings) != 0 {
+		t.Fatalf("expected no lid mappings, got %d", len(lidMappings))
+	}
+}
+
 func TestParsePhoneContactQueryResponse(t *testing.T) {
 	list := waBinary.Node{
 		Tag: "list",

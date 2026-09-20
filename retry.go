@@ -223,12 +223,14 @@ func (cli *Client) retryLock(chat, sender types.JID, messageID types.MessageID) 
 }
 
 func (cli *Client) tryHandleRetryReceipt(ctx context.Context, receipt *events.Receipt, node *waBinary.Node) {
+	var cancelled bool
 	defer func() {
 		err := recover()
 		if err != nil {
 			cli.Log.Errorf("Retry receipt handler panicked: %v\n%s", err, debug.Stack())
 		}
 	}()
+	defer cli.maybeDeferredAck(ctx, node)(&cancelled)
 	if cli.retrySema != nil {
 		err := cli.retrySema.Acquire(ctx, 1)
 		if err != nil {
@@ -725,7 +727,6 @@ func (cli *Client) immediateRequestMessageFromPhone(ctx context.Context, info *t
 	} else {
 		cli.Log.Debugf("Requested message %s from phone with request_id=%s request_timestamp=%s", info.ID, resp.ID, resp.Timestamp.Format(time.RFC3339))
 	}
-	return
 }
 
 func (cli *Client) clearDelayedMessageRequests() {
