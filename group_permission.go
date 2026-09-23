@@ -37,6 +37,26 @@ func (cli *Client) GetStoredGroupSendPermission(ctx context.Context, groupJID ty
 	return permissionStore.GetGroupSendPermission(ctx, groupJID, cli.getOwnID(), cli.getOwnLID())
 }
 
+func (cli *Client) checkStoredGroupSendPermission(ctx context.Context, groupJID types.JID) error {
+	permission, err := cli.GetStoredGroupSendPermission(ctx, groupJID)
+	if errors.Is(err, ErrGroupPermissionStoreUnavailable) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if permission == nil || !permission.StateKnown {
+		return nil
+	}
+	if !permission.IsJoined || !permission.IsMember || permission.Suspended {
+		return ErrGroupSendPermissionDenied
+	}
+	if permission.IsAnnounce && !permission.IsAdmin {
+		return ErrGroupSendPermissionDenied
+	}
+	return nil
+}
+
 func groupInfoEventAffectsSendPermission(evt *events.GroupInfo) bool {
 	return evt != nil && (evt.Announce != nil || evt.Delete != nil || evt.Suspended || evt.Unsuspended ||
 		len(evt.Join) > 0 || len(evt.Leave) > 0 || len(evt.Promote) > 0 || len(evt.Demote) > 0)

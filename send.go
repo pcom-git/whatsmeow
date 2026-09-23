@@ -302,6 +302,10 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 	if to.Server == types.GroupServer || to.Server == types.BroadcastServer {
 		start := time.Now()
 		if to.Server == types.GroupServer {
+			err = cli.checkStoredGroupSendPermission(ctx, to)
+			if err != nil {
+				return
+			}
 			var cachedData *groupMetaCache
 			cachedData, err = cli.getCachedGroupData(ctx, to)
 			if err != nil {
