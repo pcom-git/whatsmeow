@@ -308,13 +308,21 @@ func findLIDInUserInfo(pn types.JID, userInfo map[types.JID]types.UserInfo) type
 }
 
 // GetLIDByUsername resolves a WhatsApp username to an LID using an interactive USync query.
-func (cli *Client) GetLIDByUsername(ctx context.Context, username string) (types.JID, error) {
+// At most one optional username PIN may be provided. An empty PIN is treated as omitted.
+func (cli *Client) GetLIDByUsername(ctx context.Context, username string, pin ...string) (types.JID, error) {
 	if cli == nil {
 		return types.EmptyJID, ErrClientIsNil
 	}
 	username = strings.TrimSpace(username)
 	if username == "" {
 		return types.EmptyJID, errors.New("username is empty")
+	}
+	if len(pin) > 1 {
+		return types.EmptyJID, errors.New("only one PIN may be provided to GetLIDByUsername")
+	}
+	var usernamePIN string
+	if len(pin) == 1 {
+		usernamePIN = pin[0]
 	}
 
 	resp, err := cli.sendIQ(ctx, infoQuery{
@@ -323,7 +331,7 @@ func (cli *Client) GetLIDByUsername(ctx context.Context, username string) (types
 		To:        types.ServerJID,
 		Timeout:   32 * time.Second,
 		Content: []waBinary.Node{
-			buildUsernameLIDUSyncNode(cli.generateRequestID(), username),
+			buildUsernameLIDUSyncNode(cli.generateRequestID(), username, usernamePIN),
 		},
 	})
 	if err != nil {
@@ -332,7 +340,12 @@ func (cli *Client) GetLIDByUsername(ctx context.Context, username string) (types
 	return parseUsernameLIDUSyncResponse(resp, username)
 }
 
-func buildUsernameLIDUSyncNode(requestID, username string) waBinary.Node {
+func buildUsernameLIDUSyncNode(requestID, username, pin string) waBinary.Node {
+	contactAttrs := waBinary.Attrs{"username": username}
+	if pin != "" {
+		contactAttrs["pin"] = pin
+	}
+
 	return waBinary.Node{
 		Tag: "usync",
 		Attrs: waBinary.Attrs{
@@ -357,7 +370,7 @@ func buildUsernameLIDUSyncNode(requestID, username string) waBinary.Node {
 					Tag: "user",
 					Content: []waBinary.Node{{
 						Tag:   "contact",
-						Attrs: waBinary.Attrs{"username": username},
+						Attrs: contactAttrs,
 					}},
 				}},
 			},
