@@ -77,6 +77,9 @@ func (cli *Client) fetchAppStateLocked(ctx context.Context, name appstate.WAPatc
 	for hasMore {
 		patches, err := cli.fetchAppStatePatches(ctx, name, state.Version, wantSnapshot)
 		if err != nil {
+			if fullSync && ctx.Err() == nil && cli.BackgroundEventCtx.Err() == nil {
+				cli.dispatchEvent(&events.AppStateSyncError{Name: name, FullSync: fullSync, Error: err})
+			}
 			return nil, fmt.Errorf("failed to fetch app state %s patches: %w", name, err)
 		} else if !wantSnapshot && patches.Snapshot != nil {
 			return nil, fmt.Errorf("server unexpectedly returned snapshot for %s without asking", name)
@@ -595,6 +598,15 @@ func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchNa
 				Secret: secret.GetRootSecret(),
 			}
 		}))
+		if storeUpdateError == nil && cli.Store.ChatSettings != nil {
+			var active *waSyncAction.WASARootSecretAction_RootSecretEntry
+			for _, secret := range inputSecrets {
+				if secret.GetStatus() == waSyncAction.WASARootSecretAction_RootSecretEntry_ACTIVE && (active == nil || secret.GetEpoch() > active.GetEpoch()) {
+					active = secret
+				}
+			}
+			storeUpdateError = cli.Store.ChatSettings.PutWASARootSecretID(ctx, botJID, types.MessageID(active.GetID()))
+		}
 		if storeUpdateError == nil {
 			zerolog.Ctx(ctx).Debug().
 				Strs("ids", ids).

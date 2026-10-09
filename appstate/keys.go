@@ -71,6 +71,8 @@ const (
 	IndexLockMessage                     = "lock_message"
 	IndexContactManagerMetadata          = "contact_manager_metadata"
 	IndexBusinessFolderActivation        = "business_folder_activation"
+	IndexGroupHistoryToggle              = "group_history_toggle"
+	IndexBBProPendingCustomerBaseAction  = "bb_pro_pending_customer_base_action"
 )
 
 // Constants for the regular app state indexes.

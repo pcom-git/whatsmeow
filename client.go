@@ -118,6 +118,7 @@ type Client struct {
 
 	uploadPreKeysLock sync.Mutex
 	lastPreKeyUpload  time.Time
+	PreKeysUploaded   *exsync.Event
 
 	mediaConnCache *MediaConn
 	mediaConnLock  sync.Mutex
