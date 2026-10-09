@@ -293,6 +293,7 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 		appStateProc:        appstate.NewProcessor(deviceStore, log.Sub("AppState")),
 		socketWait:          make(chan struct{}),
 		expectedDisconnect:  exsync.NewEvent(),
+		PreKeysUploaded:     exsync.NewEvent(),
 
 		incomingRetryRequestCounter: make(map[incomingRetryKey]int),
 
