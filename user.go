@@ -1366,5 +1366,6 @@ func (cli *Client) UpdateBlocklist(ctx context.Context, lidJID types.JID, action
 	if !ok {
 		return nil, &ElementMissingError{Tag: "list", In: "response to blocklist update"}
 	}
-	return cli.parseBlocklist(&list), nil
+	blocklist, _ := cli.parseBlocklist(&list)
+	return blocklist, nil
 }
