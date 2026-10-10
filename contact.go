@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -159,6 +160,36 @@ func addContactPhoneJIDUser(phone string) string {
 	return phone
 }
 
+func isAddContactPhoneDigits(phone string) bool {
+	if phone == "" {
+		return false
+	}
+	for i := range phone {
+		if phone[i] < '0' || phone[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// matchesAddContactPhone accepts only an exact match or the Brazilian ninth-digit
+// difference in a server-resolved PN. It must not be used to rewrite requests.
+func matchesAddContactPhone(phone, resolved string) bool {
+	if !isAddContactPhoneDigits(phone) || !isAddContactPhoneDigits(resolved) {
+		return false
+	}
+	if phone == resolved {
+		return true
+	}
+	long, short := phone, resolved
+	if len(long) < len(short) {
+		long, short = short, long
+	}
+	return len(long) == 13 && len(short) == 12 &&
+		strings.HasPrefix(long, "55") &&
+		long[4] == '9' && long[:4] == short[:4] && long[5:] == short[4:]
+}
+
 func addContactPhoneQueryValue(phone string) string {
 	if phone == "" || strings.HasPrefix(phone, "+") {
 		return phone
@@ -183,7 +214,7 @@ func (cli *Client) resolveAddContactPhone(ctx context.Context, phone string) (ad
 	if err != nil {
 		return addContactIdentity{}, fmt.Errorf("failed to delta contact phone %s: %w", phone, err)
 	}
-	if err = parsePhoneContactDeltaResponse(list, result, phone, identity.LIDJID); err != nil {
+	if err = parsePhoneContactDeltaResponse(list, result, phone, identity); err != nil {
 		return addContactIdentity{}, err
 	}
 	return identity, nil
@@ -350,33 +381,86 @@ func parseAddContactUSyncResponse(resp *waBinary.Node) (*waBinary.Node, *waBinar
 }
 
 func parsePhoneContactQueryResponse(list *waBinary.Node, phone string) (addContactIdentity, error) {
-	for _, user := range list.GetChildrenByTag("user") {
-		contact := user.GetChildByTag("contact")
-		contactType := contact.AttrGetter().OptionalString("type")
-		if contactType != "in" {
-			return addContactIdentity{}, fmt.Errorf("phone %s is not an active WhatsApp contact: type=%s", phone, contactType)
+	if !isAddContactPhoneDigits(phone) {
+		return addContactIdentity{}, fmt.Errorf("invalid phone %q in contact query", phone)
+	}
+	if list == nil {
+		return addContactIdentity{}, fmt.Errorf("missing user in phone contact query response for %s", phone)
+	}
+	users := list.GetChildrenByTag("user")
+	if len(users) == 0 {
+		return addContactIdentity{}, fmt.Errorf("missing user in phone contact query response for %s", phone)
+	} else if len(users) != 1 {
+		return addContactIdentity{}, fmt.Errorf("expected one user in phone contact query response for %s, got %d", phone, len(users))
+	}
+	user := users[0]
+	contact, ok := user.GetOptionalChildByTag("contact")
+	if !ok {
+		return addContactIdentity{}, &ElementMissingError{Tag: "contact", In: "phone contact query response"}
+	}
+	contactType := contact.AttrGetter().OptionalString("type")
+	if contactType != "in" {
+		return addContactIdentity{}, fmt.Errorf("phone %s is not an active WhatsApp contact: type=%s", phone, contactType)
+	}
+	lid, err := parsePhoneContactJID(&user, "jid", types.HiddenUserServer)
+	if err != nil {
+		return addContactIdentity{}, err
+	}
+	pn := types.NewJID(addContactPhoneJIDUser(phone), types.DefaultUserServer)
+	if _, present := user.Attrs["pn_jid"]; present {
+		pn, err = parsePhoneContactJID(&user, "pn_jid", types.DefaultUserServer)
+		if err != nil {
+			return addContactIdentity{}, err
 		}
-		lid := optionalAddContactJID(&user, "jid")
-		if lid.IsEmpty() {
-			return addContactIdentity{}, fmt.Errorf("missing LID for phone %s in contact query response", phone)
-		}
-		pn := optionalAddContactJID(&user, "pn_jid")
-		if pn.IsEmpty() {
-			pn = types.NewJID(addContactPhoneJIDUser(phone), types.DefaultUserServer)
-		} else if expectedUser := addContactPhoneJIDUser(phone); expectedUser != "" && pn.User != expectedUser {
+		if !matchesAddContactPhone(phone, pn.User) {
 			return addContactIdentity{}, fmt.Errorf("phone %s resolved to unexpected pn_jid %s", phone, pn)
 		}
-		username := contact.AttrGetter().OptionalString("username")
-		if username == "" {
-			usernameNode := user.GetChildByTag("username")
+	}
+	username := contact.AttrGetter().OptionalString("username")
+	if username == "" {
+		if usernameNode, present := user.GetOptionalChildByTag("username"); present {
 			username = usernameNode.AttrGetter().OptionalString("username")
 		}
-		return addContactIdentity{PhoneJID: pn.ToNonAD(), LIDJID: lid.ToNonAD(), Username: username}, nil
 	}
-	return addContactIdentity{}, fmt.Errorf("missing user in phone contact query response for %s", phone)
+	return addContactIdentity{PhoneJID: pn, LIDJID: lid, Username: username}, nil
 }
 
-func parsePhoneContactDeltaResponse(list, result *waBinary.Node, phone string, expectedLID types.JID) error {
+func parsePhoneContactJID(user *waBinary.Node, key, server string) (types.JID, error) {
+	// ParseJID accepts some non-user forms, so validate the response attribute as
+	// well as the parsed identity. An invalid PN must never become a fallback PN.
+	if user == nil {
+		return types.EmptyJID, fmt.Errorf("missing %s in phone contact query response", key)
+	}
+	if value, ok := user.Attrs[key].(string); ok {
+		local, actualServer, valid := strings.Cut(value, "@")
+		if !valid || actualServer != server {
+			return types.EmptyJID, fmt.Errorf("invalid %s in phone contact query response", key)
+		}
+		// Validate before ToNonAD drops the suffixes: ParseJID casts signed
+		// integers to uint8/uint16 without rejecting negative or overflowing values.
+		userPart, device, hasDevice := strings.Cut(local, ":")
+		if hasDevice {
+			_, err := strconv.ParseUint(device, 10, 16)
+			if !isAddContactPhoneDigits(device) || err != nil {
+				return types.EmptyJID, fmt.Errorf("invalid %s device in phone contact query response", key)
+			}
+		}
+		_, agent, hasAgent := strings.Cut(userPart, ".")
+		if hasAgent {
+			_, err := strconv.ParseUint(agent, 10, 8)
+			if !isAddContactPhoneDigits(agent) || err != nil {
+				return types.EmptyJID, fmt.Errorf("invalid %s agent in phone contact query response", key)
+			}
+		}
+	}
+	jid := optionalAddContactJID(user, key)
+	if jid.Server != server || !isAddContactPhoneDigits(jid.User) {
+		return types.EmptyJID, fmt.Errorf("missing or invalid %s in phone contact query response", key)
+	}
+	return jid, nil
+}
+
+func parsePhoneContactDeltaResponse(list, result *waBinary.Node, phone string, expected addContactIdentity) error {
 	if err := requireAddContactIntegrity(result); err != nil {
 		return err
 	}
@@ -384,8 +468,13 @@ func parsePhoneContactDeltaResponse(list, result *waBinary.Node, phone string, e
 	if err != nil {
 		return err
 	}
-	if !expectedLID.IsEmpty() && identity.LIDJID != expectedLID {
-		return fmt.Errorf("phone delta LID mismatch for %s: expected %s, got %s", phone, expectedLID, identity.LIDJID)
+	if identity.LIDJID != expected.LIDJID {
+		return fmt.Errorf("phone delta LID mismatch for %s: expected %s, got %s", phone, expected.LIDJID, identity.LIDJID)
+	}
+	// Compare the actual PN, not just its Brazilian alias. If query resolved an
+	// alias, a missing delta PN falls back to the input and must fail this check.
+	if identity.PhoneJID != expected.PhoneJID {
+		return fmt.Errorf("phone delta PN mismatch for %s: expected %s, got %s", phone, expected.PhoneJID, identity.PhoneJID)
 	}
 	return nil
 }
@@ -452,6 +541,9 @@ func optionalAddContactJID(node *waBinary.Node, key string) types.JID {
 }
 
 func requireAddContactIntegrity(result *waBinary.Node) error {
+	if result == nil {
+		return &ElementMissingError{Tag: "contact", In: "add contact usync result"}
+	}
 	contact, ok := result.GetOptionalChildByTag("contact")
 	if !ok {
 		return &ElementMissingError{Tag: "contact", In: "add contact usync result"}
