@@ -258,10 +258,10 @@ func contactActionLIDMapping(indexJID types.JID, act *waSyncAction.ContactAction
 }
 
 func contactActionIsAddContact(act *waSyncAction.ContactAction) bool {
-	if act == nil || act.SaveOnPrimaryAddressbook == nil {
-		return true
-	}
-	return act.GetSaveOnPrimaryAddressbook()
+	// A contact can be saved only in WhatsApp without being saved to the
+	// primary device's address book. The contact action identifies the saved
+	// contact; SaveOnPrimaryAddressbook only controls phone address book sync.
+	return act != nil
 }
 
 func (cli *Client) filterContacts(mutations []appstate.Mutation) ([]appstate.Mutation, []store.ContactEntry, []store.LIDMapping) {
@@ -274,6 +274,9 @@ func (cli *Client) filterContacts(mutations []appstate.Mutation) ([]appstate.Mut
 		} else if mutation.Index[0] == appstate.IndexContact && len(mutation.Index) > 1 {
 			jid, _ := types.ParseJID(mutation.Index[1])
 			act := mutation.Action.GetContactAction()
+			if mutation.Operation == waServerSync.SyncdMutation_SET && act == nil {
+				continue
+			}
 			isAddContact := mutation.Operation == waServerSync.SyncdMutation_SET && contactActionIsAddContact(act)
 			contacts = append(contacts, store.ContactEntry{
 				JID:          jid,
@@ -287,6 +290,9 @@ func (cli *Client) filterContacts(mutations []appstate.Mutation) ([]appstate.Mut
 		} else if mutation.Index[0] == appstate.IndexLIDContact && len(mutation.Index) > 1 {
 			jid, _ := types.ParseJID(mutation.Index[1])
 			act := mutation.Action.GetLidContactAction()
+			if mutation.Operation == waServerSync.SyncdMutation_SET && act == nil {
+				continue
+			}
 			contacts = append(contacts, store.ContactEntry{
 				JID:          jid,
 				FirstName:    act.GetFirstName(),
@@ -377,6 +383,9 @@ func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchNa
 		}
 	case appstate.IndexContact:
 		act := mutation.Action.GetContactAction()
+		if mutation.Operation == waServerSync.SyncdMutation_SET && act == nil {
+			return
+		}
 		eventToDispatch = &events.Contact{JID: jid, Timestamp: ts, Action: act, FromFullSync: fullSync}
 		if cli.Store.Contacts != nil {
 			isAddContact := mutation.Operation == waServerSync.SyncdMutation_SET && contactActionIsAddContact(act)
@@ -392,6 +401,9 @@ func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchNa
 		}
 	case appstate.IndexLIDContact:
 		act := mutation.Action.GetLidContactAction()
+		if mutation.Operation == waServerSync.SyncdMutation_SET && act == nil {
+			return
+		}
 		contactAction := &waSyncAction.ContactAction{
 			FullName:  proto.String(act.GetFullName()),
 			FirstName: proto.String(act.GetFirstName()),
