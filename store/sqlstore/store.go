@@ -890,14 +890,50 @@ func (s *SQLStore) getContact(ctx context.Context, user types.JID) (*types.Conta
 	return info, nil
 }
 
+func firstNonEmptyContactField(primary, fallback string) string {
+	if primary != "" {
+		return primary
+	}
+	return fallback
+}
+
+func mergeMappedContactInfo(primary, fallback types.ContactInfo) types.ContactInfo {
+	return types.ContactInfo{
+		Found:         primary.Found || fallback.Found,
+		FirstName:     firstNonEmptyContactField(primary.FirstName, fallback.FirstName),
+		FullName:      firstNonEmptyContactField(primary.FullName, fallback.FullName),
+		PushName:      firstNonEmptyContactField(primary.PushName, fallback.PushName),
+		BusinessName:  firstNonEmptyContactField(primary.BusinessName, fallback.BusinessName),
+		RedactedPhone: firstNonEmptyContactField(primary.RedactedPhone, fallback.RedactedPhone),
+		IsAddContact:  primary.IsAddContact || fallback.IsAddContact,
+	}
+}
+
 func (s *SQLStore) GetContact(ctx context.Context, user types.JID) (types.ContactInfo, error) {
 	s.contactCacheLock.Lock()
 	info, err := s.getContact(ctx, user)
-	s.contactCacheLock.Unlock()
 	if err != nil {
+		s.contactCacheLock.Unlock()
 		return types.ContactInfo{}, err
 	}
-	return *info, nil
+	contact := *info
+	if user.Server == types.HiddenUserServer && s.LIDMap != nil {
+		pn, err := s.LIDMap.GetPNForLID(ctx, user)
+		if err != nil {
+			s.contactCacheLock.Unlock()
+			return types.ContactInfo{}, err
+		}
+		if !pn.IsEmpty() {
+			phoneInfo, err := s.getContact(ctx, pn)
+			if err != nil {
+				s.contactCacheLock.Unlock()
+				return types.ContactInfo{}, err
+			}
+			contact = mergeMappedContactInfo(*phoneInfo, contact)
+		}
+	}
+	s.contactCacheLock.Unlock()
+	return contact, nil
 }
 
 type contactTuple struct {
