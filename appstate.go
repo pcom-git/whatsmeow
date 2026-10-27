@@ -593,6 +593,21 @@ func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchNa
 			Action:       act,
 			FromFullSync: fullSync,
 		}
+	case appstate.IndexFavorites:
+		act := mutation.Action.GetFavoritesAction()
+		if cli.Store.Labels != nil {
+			favorites := act.GetFavorites()
+			members := make([]types.JID, 0, len(favorites))
+			for _, favorite := range favorites {
+				jid, err := types.ParseJID(favorite.GetID())
+				if err != nil {
+					cli.Log.Warnf("Failed to parse favorites JID %q for label store: %v", favorite.GetID(), err)
+					continue
+				}
+				members = append(members, jid)
+			}
+			storeUpdateError = cli.Store.Labels.ReplaceFavoriteMembers(ctx, members, ts, fullSync)
+		}
 	case appstate.IndexWasaRootSecretAction:
 		if len(mutation.Index) < 2 {
 			return
