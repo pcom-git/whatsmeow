@@ -109,7 +109,10 @@ func (c *Container) Upgrade(ctx context.Context) error {
 		}
 	}
 
-	return c.db.Upgrade(ctx)
+	if err := c.db.Upgrade(ctx); err != nil {
+		return err
+	}
+	return c.ensureLocalUsernameColumn(ctx)
 }
 
 const getAllDevicesQuery = `

@@ -669,10 +669,10 @@ const (
 		ON CONFLICT (our_jid, their_jid) DO UPDATE SET business_name=excluded.business_name
 	`
 	getContactQuery = `
-		SELECT first_name, full_name, push_name, business_name, redacted_phone, is_add_contact FROM whatsmeow_contacts WHERE our_jid=$1 AND their_jid=$2
+		SELECT first_name, full_name, push_name, business_name, redacted_phone, is_add_contact, local_username FROM whatsmeow_contacts WHERE our_jid=$1 AND their_jid=$2
 	`
 	getAllContactsQuery = `
-		SELECT their_jid, first_name, full_name, push_name, business_name, redacted_phone, is_add_contact FROM whatsmeow_contacts WHERE our_jid=$1
+		SELECT their_jid, first_name, full_name, push_name, business_name, redacted_phone, is_add_contact, local_username FROM whatsmeow_contacts WHERE our_jid=$1
 	`
 	getContactListPageCountQuery = `
 		SELECT COUNT(*)
@@ -689,11 +689,15 @@ const (
 			c.business_name,
 			c.redacted_phone,
 			c.is_add_contact,
+			COALESCE(NULLIF(c.local_username, ''), lid_contact.local_username, ''),
 			lm.lid
 		FROM whatsmeow_contacts c
 		LEFT JOIN whatsmeow_lid_map lm
 		  ON c.their_jid LIKE '%@s.whatsapp.net'
 		 AND replace(c.their_jid, '@s.whatsapp.net', '') = lm.pn
+		LEFT JOIN whatsmeow_contacts lid_contact
+		  ON lid_contact.our_jid = c.our_jid
+		 AND lid_contact.their_jid = lm.lid || '@lid'
 		WHERE c.our_jid = $1
 		  AND c.is_add_contact=true
 		ORDER BY c.their_jid ASC
@@ -708,11 +712,15 @@ const (
 			c.business_name,
 			c.redacted_phone,
 			c.is_add_contact,
+			COALESCE(NULLIF(c.local_username, ''), lid_contact.local_username, ''),
 			lm.lid
 		FROM whatsmeow_contacts c
 		LEFT JOIN whatsmeow_lid_map lm
 		  ON c.their_jid LIKE '%@s.whatsapp.net'
 		 AND replace(c.their_jid, '@s.whatsapp.net', '') = lm.pn
+		LEFT JOIN whatsmeow_contacts lid_contact
+		  ON lid_contact.our_jid = c.our_jid
+		 AND lid_contact.their_jid = lm.lid || '@lid'
 		WHERE c.our_jid = $1
 		  AND c.is_add_contact=true
 		  AND (
@@ -871,9 +879,9 @@ func (s *SQLStore) getContact(ctx context.Context, user types.JID) (*types.Conta
 		return cached, nil
 	}
 
-	var first, full, push, business, redactedPhone sql.NullString
+	var first, full, push, business, redactedPhone, username sql.NullString
 	var isAddContact bool
-	err := s.db.QueryRow(ctx, getContactQuery, s.JID, user).Scan(&first, &full, &push, &business, &redactedPhone, &isAddContact)
+	err := s.db.QueryRow(ctx, getContactQuery, s.JID, user).Scan(&first, &full, &push, &business, &redactedPhone, &isAddContact, &username)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
 	}
@@ -882,6 +890,7 @@ func (s *SQLStore) getContact(ctx context.Context, user types.JID) (*types.Conta
 		FirstName:     first.String,
 		FullName:      full.String,
 		PushName:      push.String,
+		Username:      username.String,
 		BusinessName:  business.String,
 		IsAddContact:  isAddContact,
 		RedactedPhone: redactedPhone.String,
@@ -903,6 +912,7 @@ func mergeMappedContactInfo(primary, fallback types.ContactInfo) types.ContactIn
 		FirstName:     firstNonEmptyContactField(primary.FirstName, fallback.FirstName),
 		FullName:      firstNonEmptyContactField(primary.FullName, fallback.FullName),
 		PushName:      firstNonEmptyContactField(primary.PushName, fallback.PushName),
+		Username:      firstNonEmptyContactField(primary.Username, fallback.Username),
 		BusinessName:  firstNonEmptyContactField(primary.BusinessName, fallback.BusinessName),
 		RedactedPhone: firstNonEmptyContactField(primary.RedactedPhone, fallback.RedactedPhone),
 		IsAddContact:  primary.IsAddContact || fallback.IsAddContact,
@@ -931,6 +941,21 @@ func (s *SQLStore) GetContact(ctx context.Context, user types.JID) (types.Contac
 			}
 			contact = mergeMappedContactInfo(*phoneInfo, contact)
 		}
+	} else if user.Server == types.DefaultUserServer && contact.Username == "" && s.LIDMap != nil {
+		lid, err := s.LIDMap.GetLIDForPN(ctx, user)
+		if err != nil {
+			s.contactCacheLock.Unlock()
+			return types.ContactInfo{}, err
+		}
+		if !lid.IsEmpty() {
+			lidInfo, err := s.getContact(ctx, lid)
+			if err != nil {
+				s.contactCacheLock.Unlock()
+				return types.ContactInfo{}, err
+			}
+			contact.Username = lidInfo.Username
+			contact.Found = contact.Found || contact.Username != ""
+		}
 	}
 	s.contactCacheLock.Unlock()
 	return contact, nil
@@ -943,9 +968,9 @@ type contactTuple struct {
 
 var convertContactRow = dbutil.ConvertRowFn[*contactTuple](func(rows dbutil.Scannable) (*contactTuple, error) {
 	var jid types.JID
-	var first, full, push, business, redactedPhone sql.NullString
+	var first, full, push, business, redactedPhone, username sql.NullString
 	var isAddContact bool
-	err := rows.Scan(&jid, &first, &full, &push, &business, &redactedPhone, &isAddContact)
+	err := rows.Scan(&jid, &first, &full, &push, &business, &redactedPhone, &isAddContact, &username)
 	if err != nil {
 		return nil, fmt.Errorf("error scanning row: %w", err)
 	}
@@ -956,6 +981,7 @@ var convertContactRow = dbutil.ConvertRowFn[*contactTuple](func(rows dbutil.Scan
 			FirstName:     first.String,
 			FullName:      full.String,
 			PushName:      push.String,
+			Username:      username.String,
 			BusinessName:  business.String,
 			IsAddContact:  isAddContact,
 			RedactedPhone: redactedPhone.String,
@@ -998,9 +1024,9 @@ func appendContactListPageRows(page store.ContactListPage, rows dbutil.Rows) (st
 
 	for rows.Next() {
 		var jid types.JID
-		var first, full, push, business, redactedPhone, lidUser sql.NullString
+		var first, full, push, business, redactedPhone, username, lidUser sql.NullString
 		var isAddContact bool
-		err := rows.Scan(&jid, &first, &full, &push, &business, &redactedPhone, &isAddContact, &lidUser)
+		err := rows.Scan(&jid, &first, &full, &push, &business, &redactedPhone, &isAddContact, &username, &lidUser)
 		if err != nil {
 			return page, fmt.Errorf("error scanning row: %w", err)
 		}
@@ -1020,6 +1046,7 @@ func appendContactListPageRows(page store.ContactListPage, rows dbutil.Rows) (st
 				FirstName:     first.String,
 				FullName:      full.String,
 				PushName:      push.String,
+				Username:      username.String,
 				BusinessName:  business.String,
 				IsAddContact:  isAddContact,
 				RedactedPhone: redactedPhone.String,

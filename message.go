@@ -27,6 +27,7 @@ import (
 	"go.mau.fi/libsignal/signalerror"
 	"go.mau.fi/libsignal/state/record"
 	"go.mau.fi/util/random"
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 
 	"go.mau.fi/whatsmeow/appstate"
@@ -88,6 +89,7 @@ func (cli *Client) handleEncryptedMessage(ctx context.Context, node *waBinary.No
 	} else if !info.RecipientAlt.IsEmpty() {
 		cli.StoreLIDPNMapping(ctx, info.RecipientAlt, info.Chat)
 	}
+	cli.storeMessageUsernames(ctx, node, info)
 	if info.VerifiedName != nil && len(info.VerifiedName.Details.GetVerifiedName()) > 0 {
 		go cli.updateBusinessName(ctx, info.Sender, info.SenderAlt, info, info.VerifiedName.Details.GetVerifiedName())
 	}
@@ -893,6 +895,16 @@ func (cli *Client) DownloadHistorySync(ctx context.Context, notif *waE2E.History
 		return nil, fmt.Errorf("failed to unmarshal: %w", err)
 	}
 	cli.Log.Debugf("Received history sync (type %s, chunk %d, progress %d)", historySync.GetSyncType(), historySync.GetChunkOrder(), historySync.GetProgress())
+	// Temporary diagnostics: preserve the full decrypted, compressed payload,
+	// including fields that the current protobuf definitions do not recognize.
+	cli.Log.Debugf("HISTORY_SYNC_ZLIB type=%s chunk=%d bytes=%d hex=%x",
+		notif.GetSyncType(), notif.GetChunkOrder(), len(data), data)
+	if dump, dumpErr := protojson.Marshal(&historySync); dumpErr != nil {
+		cli.Log.Warnf("Failed to marshal history sync dump: %v", dumpErr)
+	} else {
+		cli.Log.Debugf("HISTORY_SYNC_DATA type=%s chunk=%d progress=%d json=%s",
+			historySync.GetSyncType(), historySync.GetChunkOrder(), historySync.GetProgress(), dump)
+	}
 	doStorage := func(ctx context.Context) {
 		if err := cli.storeNCTSalt(ctx, historySync.GetNctSalt()); err != nil {
 			cli.Log.Warnf("Failed to store NCT salt from history sync: %v", err)
