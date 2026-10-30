@@ -363,6 +363,16 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 	if ok && len(node.GetChildrenByTag("enc")) == 0 {
 		uType := events.UnavailableType(unavailableNode.AttrGetter().String("type"))
 		cli.Log.Warnf("Unavailable message %s from %s (type: %q)", info.ID, info.SourceString(), uType)
+		if uType != events.UnavailableTypeViewOnce {
+			// Keep sender recovery independent of the immediate phone request and
+			// ACK: a slow or failed prekey check must not block either path.
+			go func() {
+				err := cli.sendUnavailableRetryReceipt(context.WithoutCancel(ctx), node, info, uType, cli.sendRetryFrame)
+				if err != nil {
+					cli.Log.Warnf("Failed to send retry receipt for unavailable message %s from %s: %v", info.ID, info.SourceString(), err)
+				}
+			}()
+		}
 		cli.backgroundIfAsyncAck(func() {
 			cli.immediateRequestMessageFromPhone(ctx, info)
 			cli.sendAck(ctx, node, 0)
@@ -550,6 +560,7 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 		}
 		if handlerFailed {
 			if allEncryptedChildrenSucceeded {
+				cli.cancelDelayedRetryReceipt(info)
 				cli.cancelDelayedRequestFromPhoneForMessage(info)
 			}
 			cli.Log.Warnf("Handler for %s failed", info.ID)
@@ -582,6 +593,7 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 		}
 	}
 	if recognizedStanza && !protobufFailed && allEncryptedChildrenSucceeded {
+		cli.cancelDelayedRetryReceipt(info)
 		cli.cancelDelayedRequestFromPhoneForMessage(info)
 	}
 	cli.backgroundIfAsyncAck(func() {
@@ -1050,6 +1062,7 @@ func (cli *Client) handlePlaceholderResendResponse(msg *waE2E.PeerDataOperationR
 				reqID, i+1, msgEvt.Info.ID, msgEvt.Info.SourceString(), msgEvt.Info.Timestamp.Format(time.RFC3339), msgEvt.Info.Type, msgEvt.Info.MediaType,
 			)
 			msgEvt.UnavailableRequestID = reqID
+			cli.cancelDelayedRetryReceiptFromPhone(&msgEvt.Info)
 			ok = !cli.dispatchMessageEvent(msgEvt) && ok
 		}
 	}

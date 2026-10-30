@@ -46,6 +46,7 @@ var NoopDevice = &Device{
 
 var _ AllStores = (*NoopStore)(nil)
 var _ DeviceContainer = (*NoopStore)(nil)
+var _ PreKeySyncStore = (*NoopStore)(nil)
 
 func (n *NoopStore) PutIdentity(ctx context.Context, address string, key [32]byte) error {
 	return n.Error
@@ -117,6 +118,26 @@ func (n *NoopStore) MarkPreKeysAsUploaded(ctx context.Context, upToID uint32) er
 
 func (n *NoopStore) UploadedPreKeyCount(ctx context.Context) (int, error) {
 	return 0, n.Error
+}
+
+func (n *NoopStore) UploadedPreKeyIDs(ctx context.Context) ([]uint32, error) {
+	return nil, n.Error
+}
+
+func (n *NoopStore) PreKeyIDs(ctx context.Context) ([]uint32, error) {
+	return nil, n.Error
+}
+
+func (n *NoopStore) MarkPreKeysAsUploadedIDs(ctx context.Context, ids []uint32) error {
+	return n.Error
+}
+
+func (n *NoopStore) SyncUploadedPreKeyIDs(ctx context.Context, ids []uint32) error {
+	return n.Error
+}
+
+func (n *NoopStore) ClearPreKeys(ctx context.Context) error {
+	return n.Error
 }
 
 func (n *NoopStore) PutSenderKey(ctx context.Context, group, user string, session []byte) error {

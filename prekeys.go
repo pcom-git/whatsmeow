@@ -18,6 +18,7 @@ import (
 	"go.mau.fi/libsignal/util/optional"
 
 	waBinary "go.mau.fi/whatsmeow/binary"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/util/keys"
 )
@@ -30,10 +31,17 @@ const (
 )
 
 func (cli *Client) getServerPreKeyCount(ctx context.Context) (int, error) {
-	resp, err := cli.sendIQ(ctx, infoQuery{
+	return getServerPreKeyCount(ctx, cli.sendIQ)
+}
+
+type preKeyQuery func(context.Context, infoQuery) (*waBinary.Node, error)
+
+func getServerPreKeyCount(ctx context.Context, query preKeyQuery) (int, error) {
+	resp, err := query(ctx, infoQuery{
 		Namespace: "encrypt",
 		Type:      "get",
 		To:        types.ServerJID,
+		NoRetry:   true,
 		Content: []waBinary.Node{
 			{Tag: "count"},
 		},
@@ -41,20 +49,42 @@ func (cli *Client) getServerPreKeyCount(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("failed to get prekey count on server: %w", err)
 	}
+	if resp == nil {
+		return 0, fmt.Errorf("empty prekey count response")
+	}
 	count := resp.GetChildByTag("count")
 	ag := count.AttrGetter()
 	val := ag.Int("value")
+	if val < 0 {
+		return 0, fmt.Errorf("invalid prekey count %d", val)
+	}
 	return val, ag.Error()
 }
 
 func (cli *Client) uploadPreKeys(ctx context.Context, initialUpload bool) {
-	cli.uploadPreKeysLock.Lock()
+	if err := cli.uploadPreKeysLock.Lock(ctx); err != nil {
+		cli.Log.Warnf("Prekey upload canceled while waiting: %v", err)
+		return
+	}
 	defer cli.uploadPreKeysLock.Unlock()
-	if cli.lastPreKeyUpload.Add(10 * time.Minute).After(time.Now()) {
-		sc, _ := cli.getServerPreKeyCount(ctx)
+	if err := cli.uploadPreKeysLocked(ctx, initialUpload, false, cli.sendIQ); err != nil {
+		cli.Log.Warnf("Failed to upload prekeys: %v", err)
+	}
+}
+
+// The caller holds uploadPreKeysLock, including across health checks and repairs.
+func (cli *Client) uploadPreKeysLocked(ctx context.Context, initialUpload, force bool, query preKeyQuery) error {
+	if err := validateLocalPreKeys(cli.Store); err != nil {
+		return err
+	}
+	if !force && !initialUpload && cli.lastPreKeyUpload.Add(10*time.Minute).After(time.Now()) {
+		sc, err := getServerPreKeyCount(ctx, query)
+		if err != nil {
+			return err
+		}
 		if sc >= WantedPreKeyCount {
 			cli.Log.Debugf("Canceling prekey upload request due to likely race condition")
-			return
+			return nil
 		}
 	}
 	var registrationIDBytes [4]byte
@@ -65,14 +95,44 @@ func (cli *Client) uploadPreKeys(ctx context.Context, initialUpload bool) {
 	}
 	preKeys, err := cli.Store.PreKeys.GetOrGenPreKeys(ctx, uint32(wantedCount))
 	if err != nil {
-		cli.Log.Errorf("Failed to get prekeys to upload: %v", err)
-		return
+		return fmt.Errorf("failed to get prekeys to upload: %w", err)
+	}
+	if len(preKeys) == 0 {
+		return fmt.Errorf("store returned no prekeys to upload")
+	}
+	ids := make([]uint32, len(preKeys))
+	seen := make(map[uint32]struct{}, len(preKeys))
+	var maxID uint32
+	for i, key := range preKeys {
+		if key == nil || key.Priv == nil || key.Pub == nil || key.KeyID < store.PreKeyServerIDMin || key.KeyID > store.PreKeyServerIDMax {
+			return fmt.Errorf("store returned an invalid server prekey at index %d", i)
+		}
+		if *keys.NewKeyPairFromPrivateKey(*key.Priv).Pub != *key.Pub {
+			return fmt.Errorf("store returned a public/private key mismatch for prekey %d", key.KeyID)
+		}
+		if _, duplicate := seen[key.KeyID]; duplicate {
+			return fmt.Errorf("store returned duplicate prekey ID %d", key.KeyID)
+		}
+		seen[key.KeyID] = struct{}{}
+		ids[i] = key.KeyID
+		maxID = max(maxID, key.KeyID)
+	}
+	// Reserve the exact IDs before sending: a lost IQ response does not prove
+	// the server did not distribute these one-time keys. Never publish them twice.
+	if syncStore, ok := cli.Store.PreKeys.(store.PreKeySyncStore); ok {
+		err = syncStore.MarkPreKeysAsUploadedIDs(ctx, ids)
+	} else {
+		err = cli.Store.PreKeys.MarkPreKeysAsUploaded(ctx, maxID)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to reserve prekeys before upload: %w", err)
 	}
 	cli.Log.Infof("Uploading %d new prekeys to server", len(preKeys))
-	_, err = cli.sendIQ(ctx, infoQuery{
+	_, err = query(ctx, infoQuery{
 		Namespace: "encrypt",
 		Type:      "set",
 		To:        types.ServerJID,
+		NoRetry:   true,
 		Content: []waBinary.Node{
 			{Tag: "registration", Content: registrationIDBytes[:]},
 			{Tag: "type", Content: []byte{ecc.DjbType}},
@@ -82,17 +142,14 @@ func (cli *Client) uploadPreKeys(ctx context.Context, initialUpload bool) {
 		},
 	})
 	if err != nil {
-		cli.Log.Errorf("Failed to send request to upload prekeys: %v", err)
-		return
+		return fmt.Errorf("failed to send request to upload prekeys: %w", err)
 	}
 	cli.Log.Debugf("Got response to uploading prekeys")
-	err = cli.Store.PreKeys.MarkPreKeysAsUploaded(ctx, preKeys[len(preKeys)-1].KeyID)
-	if err != nil {
-		cli.Log.Warnf("Failed to mark prekeys as uploaded: %v", err)
-		return
-	}
 	cli.lastPreKeyUpload = time.Now()
-	cli.PreKeysUploaded.Set()
+	if cli.PreKeysUploaded != nil {
+		cli.PreKeysUploaded.Set()
+	}
+	return nil
 }
 
 func (cli *Client) fetchPreKeysNoError(ctx context.Context, retryDevices []types.JID) map[types.JID]*prekey.Bundle {

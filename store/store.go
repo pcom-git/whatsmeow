@@ -47,6 +47,34 @@ type PreKeyStore interface {
 	UploadedPreKeyCount(ctx context.Context) (int, error)
 }
 
+const (
+	PreKeyIDMin       uint32 = 1
+	PreKeyIDMax       uint32 = 16_777_214
+	PreKeyServerIDMin uint32 = PreKeyIDMin
+	PreKeyServerIDMax uint32 = 16_000_000
+	PreKeyRetryIDMin  uint32 = PreKeyServerIDMax + 1
+	PreKeyRetryIDMax  uint32 = PreKeyIDMax
+)
+
+// PreKeySyncStore is an optional extension for reconciling the server's prekey
+// inventory after the caller has confirmed an inconsistency. Existing private
+// keys must never be renamed to a different server ID or re-published.
+// Existing PreKeyStore implementations do not need to implement this interface.
+type PreKeySyncStore interface {
+	// PreKeyIDs lists every existing ordinary prekey, including pending keys.
+	// Retry-only prekeys are excluded from server inventory reconciliation.
+	PreKeyIDs(ctx context.Context) ([]uint32, error)
+	UploadedPreKeyIDs(ctx context.Context) ([]uint32, error)
+	MarkPreKeysAsUploadedIDs(ctx context.Context, ids []uint32) error
+	// SyncUploadedPreKeyIDs keeps only existing ordinary prekeys whose IDs are
+	// in ids, marks them uploaded, and deletes other ordinary prekeys. Retry-only
+	// keys are excluded. It must not create or rename missing private keys.
+	SyncUploadedPreKeyIDs(ctx context.Context, ids []uint32) error
+	// ClearPreKeys deletes all ordinary and retry-only one-time prekeys for this
+	// device. Identity keys, signed prekeys and Signal sessions are not affected.
+	ClearPreKeys(ctx context.Context) error
+}
+
 type SenderKeyStore interface {
 	PutSenderKey(ctx context.Context, group, user string, session []byte) error
 	GetSenderKey(ctx context.Context, group, user string) ([]byte, error)

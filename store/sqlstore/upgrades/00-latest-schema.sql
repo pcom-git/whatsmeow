@@ -1,4 +1,4 @@
--- v0 -> v19 (compatible with v8+): Latest schema
+-- v0 -> v20 (compatible with v8+): Latest schema
 CREATE TABLE whatsmeow_device (
 	jid TEXT PRIMARY KEY,
 	lid TEXT,
@@ -43,10 +43,13 @@ CREATE TABLE whatsmeow_pre_keys (
 	key_id   INTEGER          CHECK ( key_id >= 0 AND key_id < 16777216 ),
 	key      bytea   NOT NULL CHECK ( length(key) = 32 ),
 	uploaded BOOLEAN NOT NULL,
+	created_at BIGINT NOT NULL DEFAULT 0,
 
 	PRIMARY KEY (jid, key_id),
 	FOREIGN KEY (jid) REFERENCES whatsmeow_device(jid) ON DELETE CASCADE ON UPDATE CASCADE
 );
+
+CREATE INDEX whatsmeow_pre_keys_created_at ON whatsmeow_pre_keys (jid, created_at, key_id);
 
 CREATE TABLE whatsmeow_sessions (
 	our_jid  TEXT,

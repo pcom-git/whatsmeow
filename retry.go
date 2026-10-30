@@ -20,6 +20,7 @@ import (
 	"go.mau.fi/libsignal/groups"
 	"go.mau.fi/libsignal/keys/prekey"
 	"go.mau.fi/libsignal/protocol"
+	"go.mau.fi/util/exsync"
 	"google.golang.org/protobuf/proto"
 
 	waBinary "go.mau.fi/whatsmeow/binary"
@@ -189,13 +190,26 @@ type messageRetryKey struct {
 	messageID types.MessageID
 }
 
+type retryReceiptState struct {
+	sentAt         time.Time
+	failedEncCount int
+	pending        chan struct{}
+	resolved       bool
+}
+
 type phoneRerequestState struct {
 	retryCount int
 	cancel     context.CancelFunc
 	done       <-chan struct{}
 }
 
-const retryLockCount = 64
+const (
+	retryLockCount = 64
+	// A duplicate delivery must not immediately use up all retry attempts, but
+	// peers that omit or repeat enc.count must still be able to recover.
+	retryReceiptFallbackInterval = 5 * time.Second
+	delayedRetryReceiptTimeout   = 30 * time.Second
+)
 
 func messageRetryKeyFromInfo(info *types.MessageInfo) messageRetryKey {
 	return messageRetryKey{chat: info.Chat, sender: info.Sender, messageID: info.ID}
@@ -327,7 +341,58 @@ func (cli *Client) sendRetryFrame(ctx context.Context, node waBinary.Node) error
 		}
 		return sock.SendFrame(ctx, payload)
 	}
-	return sendRetryFrameWithReconnect(ctx, node, send, cli.WaitForConnection)
+	wait := func(timeout time.Duration) bool {
+		return waitForRetryConnection(ctx, timeout, func() bool {
+			return cli.IsConnected() && cli.IsLoggedIn()
+		}, cli.expectedDisconnect.GetChan())
+	}
+	return sendRetryFrameWithReconnect(ctx, node, send, wait)
+}
+
+// Retry receipts can hold the prekey-publication lock while reconnecting. The
+// post-connect health check also needs that lock before notifying socketWait,
+// so observe authenticated socket state independently of that notification.
+func waitForRetryConnection(ctx context.Context, timeout time.Duration, ready func() bool, stop exsync.EventChan) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	select {
+	case <-stop:
+		return false
+	default:
+	}
+	if ready() {
+		return true
+	}
+	if timeout <= 0 {
+		return false
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-stop:
+			return false
+		case <-timer.C:
+			return false
+		case <-ticker.C:
+			if ctx.Err() != nil {
+				return false
+			}
+			select {
+			case <-stop:
+				return false
+			default:
+			}
+			if ready() {
+				return true
+			}
+		}
+	}
 }
 
 // handleRetryReceipt handles an incoming retry receipt for an outgoing message.
@@ -734,6 +799,7 @@ func (cli *Client) immediateRequestMessageFromPhone(ctx context.Context, info *t
 }
 
 func (cli *Client) clearDelayedMessageRequests() {
+	cli.clearDelayedRetryReceipts()
 	var cancellations []context.CancelFunc
 	cli.pendingPhoneRerequestsLock.Lock()
 	for key, state := range cli.pendingPhoneRerequests {
@@ -776,41 +842,113 @@ func retryReceiptCount(failedEncCount int) (int, error) {
 	if failedEncCount < 0 || failedEncCount > maxIncomingRetryCount {
 		return 0, fmt.Errorf("invalid failed encryption count %d", failedEncCount)
 	}
+	if failedEncCount == maxIncomingRetryCount {
+		return 0, nil
+	}
 	return failedEncCount + 1, nil
 }
 
-func (cli *Client) sendRetryReceiptWithCount(ctx context.Context, node *waBinary.Node, info *types.MessageInfo, forceIncludeIdentity bool, failedEncCount int) error {
+func nextRetryReceiptCount(failedEncCount, previousRetryCount int, previous retryReceiptState, now time.Time) (int, error) {
 	retryCount, err := retryReceiptCount(failedEncCount)
-	if err != nil {
+	if err != nil || retryCount == 0 {
+		return 0, err
+	}
+	if previous.resolved || previousRetryCount >= maxIncomingRetryCount {
+		return 0, nil
+	}
+	if retryCount > previousRetryCount {
+		return retryCount, nil
+	}
+	// Ignore explicitly older rounds. Zero also represents a missing count and
+	// is allowed to fall back to locally tracked successful sends.
+	if failedEncCount > 0 && failedEncCount < previous.failedEncCount {
+		return 0, nil
+	}
+	if previous.sentAt.IsZero() || now.Sub(previous.sentAt) < retryReceiptFallbackInterval {
+		return 0, nil
+	}
+	return previousRetryCount + 1, nil
+}
+
+func (cli *Client) sendRetryReceiptWithCount(ctx context.Context, node *waBinary.Node, info *types.MessageInfo, forceIncludeIdentity bool, failedEncCount int) error {
+	return cli.sendRetryReceiptWithCountUsing(ctx, node, info, forceIncludeIdentity, failedEncCount, true, cli.sendRetryFrame)
+}
+
+func (cli *Client) sendUnavailableRetryReceipt(ctx context.Context, node *waBinary.Node, info *types.MessageInfo, unavailableType events.UnavailableType, send func(context.Context, waBinary.Node) error) error {
+	if unavailableType == events.UnavailableTypeViewOnce {
+		return nil
+	}
+	// The unavailable handler already requests the phone immediately. Do not
+	// schedule another phone request through the normal retry path.
+	return cli.sendRetryReceiptWithCountUsing(ctx, node, info, false, 0, false, send)
+}
+
+func (cli *Client) sendRetryReceiptWithCountUsing(ctx context.Context, node *waBinary.Node, info *types.MessageInfo, forceIncludeIdentity bool, failedEncCount int, requestFromPhone bool, send func(context.Context, waBinary.Node) error) error {
+	return cli.sendRetryReceiptAttempt(ctx, node, info, retryReceiptAttempt{
+		forceIncludeIdentity: forceIncludeIdentity, failedEncCount: failedEncCount,
+		requestFromPhone: requestFromPhone, send: send, allowDelay: true,
+	})
+}
+
+type retryReceiptAttempt struct {
+	forceIncludeIdentity bool
+	failedEncCount       int
+	requestFromPhone     bool
+	send                 func(context.Context, waBinary.Node) error
+	allowDelay           bool
+	pending              chan struct{}
+}
+
+func (cli *Client) sendRetryReceiptAttempt(ctx context.Context, node *waBinary.Node, info *types.MessageInfo, attempt retryReceiptAttempt) error {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	key := messageRetryKeyFromInfo(info)
 	retryLock := cli.retryLock(key.chat, key.sender, key.messageID)
 	retryLock.Lock()
 	defer retryLock.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	cli.messageRetriesLock.Lock()
 	previousRetryCount := cli.messageRetries[key]
-	if retryCount <= previousRetryCount {
+	previousState, foundState := cli.messageRetryStates[key]
+	if previousState.resolved || (attempt.pending != nil && previousState.pending != attempt.pending) {
 		cli.messageRetriesLock.Unlock()
 		return nil
 	}
-	cli.messageRetries[key] = retryCount
-	cli.messageRetriesLock.Unlock()
-	retryCountCommitted := false
-	defer func() {
-		if !retryCountCommitted {
-			cli.messageRetriesLock.Lock()
-			if previousRetryCount == 0 {
-				delete(cli.messageRetries, key)
-			} else {
-				cli.messageRetries[key] = previousRetryCount
-			}
-			cli.messageRetriesLock.Unlock()
+	retryCount, err := nextRetryReceiptCount(attempt.failedEncCount, previousRetryCount, previousState, time.Now())
+	if err == nil && retryCount > 0 && !foundState {
+		// Make even an in-flight first send visible to successful decryption,
+		// without consuming a round before the frame is actually sent.
+		if cli.messageRetryStates == nil {
+			cli.messageRetryStates = make(map[messageRetryKey]retryReceiptState)
 		}
-	}()
+		cli.messageRetryStates[key] = previousState
+	}
+	cli.messageRetriesLock.Unlock()
+	if err != nil {
+		return err
+	} else if retryCount == 0 {
+		if attempt.allowDelay {
+			cli.scheduleDelayedRetryReceipt(node, info, previousRetryCount, attempt)
+		}
+		cli.Log.Debugf("Skipping immediate duplicate, outdated or exhausted retry for %s/%s from %s (enc count %d, last sent %d)", info.Chat, info.ID, info.Sender, attempt.failedEncCount, previousRetryCount)
+		return nil
+	}
 
-	cli.schedulePhoneRerequest(ctx, info, retryCount)
+	if attempt.requestFromPhone {
+		cli.schedulePhoneRerequest(ctx, info, retryCount)
+	}
+	// The health checker coalesces calls and caches results. Re-enter it on a
+	// later round so a failed first check does not disable repair for this message.
+	if err = cli.ensureServerPreKeys(ctx); err != nil {
+		cli.Log.Warnf("Prekey consistency check failed before retry for %s/%s from %s, continuing with retry: %v", info.Chat, info.ID, info.Sender, err)
+	}
+	if active, err := cli.retryReceiptAttemptActive(ctx, key, attempt.pending); !active {
+		return err
+	}
 
 	var registrationIDBytes [4]byte
 	binary.BigEndian.PutUint32(registrationIDBytes[:], cli.Store.RegistrationID)
@@ -832,7 +970,17 @@ func (cli *Client) sendRetryReceiptWithCount(ctx context.Context, node *waBinary
 			{Tag: "registration", Content: registrationIDBytes[:]},
 		},
 	}
-	if retryCount > 1 || forceIncludeIdentity {
+	if retryCount > 1 || attempt.forceIncludeIdentity {
+		// Keep a pool rebuild from deleting this private key between generation
+		// and publication in the receipt. Acquire this only after the health
+		// check, which takes the same lock while reconciling or resetting keys.
+		if err := cli.uploadPreKeysLock.Lock(ctx); err != nil {
+			return fmt.Errorf("failed to wait for retry prekey publication: %w", err)
+		}
+		defer cli.uploadPreKeysLock.Unlock()
+		if active, err := cli.retryReceiptAttemptActive(ctx, key, attempt.pending); !active {
+			return err
+		}
 		preKey, err := cli.generateRetryPreKey(ctx)
 		if err != nil {
 			return fmt.Errorf("failed to get prekey for retry receipt: %w", err)
@@ -852,10 +1000,168 @@ func (cli *Client) sendRetryReceiptWithCount(ctx context.Context, node *waBinary
 			},
 		})
 	}
-	if err := cli.sendRetryFrame(ctx, payload); err != nil {
+	if active, err := cli.retryReceiptAttemptActive(ctx, key, attempt.pending); !active {
+		return err
+	}
+	if err := attempt.send(ctx, payload); err != nil {
 		return fmt.Errorf("failed to send retry receipt: %w", err)
 	}
-	retryCountCommitted = true
+	// Only a successful frame send consumes a round. The per-message lock also
+	// protects this commit from another attempt overtaking a failed send.
+	cli.messageRetriesLock.Lock()
+	if cli.messageRetries == nil {
+		cli.messageRetries = make(map[messageRetryKey]int)
+	}
+	if cli.messageRetryStates == nil {
+		cli.messageRetryStates = make(map[messageRetryKey]retryReceiptState)
+	}
+	current := cli.messageRetryStates[key]
+	if current.resolved || (attempt.pending != nil && current.pending != attempt.pending) || ctx.Err() != nil {
+		cli.messageRetriesLock.Unlock()
+		return ctx.Err()
+	}
+	if current.pending != nil {
+		close(current.pending)
+	}
+	cli.messageRetries[key] = retryCount
+	cli.messageRetryStates[key] = retryReceiptState{
+		sentAt:         time.Now(),
+		failedEncCount: max(previousState.failedEncCount, attempt.failedEncCount),
+	}
+	cli.messageRetriesLock.Unlock()
 	cli.Log.Debugf("Sent retry receipt for %s/%s from %s with count %d", info.Chat, info.ID, info.Sender, retryCount)
 	return nil
+}
+
+func (cli *Client) retryReceiptAttemptActive(ctx context.Context, key messageRetryKey, pending chan struct{}) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	cli.messageRetriesLock.Lock()
+	defer cli.messageRetriesLock.Unlock()
+	state := cli.messageRetryStates[key]
+	return !state.resolved && (pending == nil || state.pending == pending), nil
+}
+
+// Only an actual failed delivery arms this timer. A successful timer send does
+// not schedule another attempt by itself; a later failure must request it.
+func (cli *Client) scheduleDelayedRetryReceipt(node *waBinary.Node, info *types.MessageInfo, previousRetryCount int, attempt retryReceiptAttempt) {
+	key := messageRetryKeyFromInfo(info)
+	cli.messageRetriesLock.Lock()
+	state := cli.messageRetryStates[key]
+	if state.resolved || state.pending != nil || state.sentAt.IsZero() || previousRetryCount < 1 || previousRetryCount >= maxIncomingRetryCount ||
+		attempt.failedEncCount < 0 || attempt.failedEncCount >= maxIncomingRetryCount || attempt.failedEncCount+1 > previousRetryCount ||
+		(attempt.failedEncCount > 0 && attempt.failedEncCount < state.failedEncCount) {
+		cli.messageRetriesLock.Unlock()
+		return
+	}
+	delay := time.Until(state.sentAt.Add(retryReceiptFallbackInterval))
+	if delay <= 0 {
+		cli.messageRetriesLock.Unlock()
+		return
+	}
+	state.pending = make(chan struct{})
+	cli.messageRetryStates[key] = state
+	cli.messageRetriesLock.Unlock()
+	// Retain just the attributes needed for the receipt, not the ciphertext.
+	nodeCopy := &waBinary.Node{Tag: node.Tag, Attrs: make(waBinary.Attrs, len(node.Attrs))}
+	for name, value := range node.Attrs {
+		nodeCopy.Attrs[name] = value
+	}
+	infoCopy := *info
+	attempt.pending, attempt.allowDelay = state.pending, false
+	go cli.waitForDelayedRetryReceipt(nodeCopy, &infoCopy, key, attempt, delay)
+}
+
+func (cli *Client) waitForDelayedRetryReceipt(node *waBinary.Node, info *types.MessageInfo, key messageRetryKey, attempt retryReceiptAttempt, delay time.Duration) {
+	baseCtx := cli.BackgroundEventCtx
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(baseCtx, delayedRetryReceiptTimeout)
+	defer cancel()
+	defer cli.finishDelayedRetryReceipt(key, attempt.pending)
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return
+	case <-attempt.pending:
+		return
+	case <-timer.C:
+	}
+	// Resolution or disconnect must also cancel a timer that has already entered
+	// a potentially slow health check or frame send.
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-attempt.pending:
+			cancel()
+		case <-ctx.Done():
+		case <-done:
+		}
+	}()
+	if err := cli.sendRetryReceiptAttempt(ctx, node, info, attempt); err != nil && ctx.Err() == nil {
+		cli.Log.Warnf("Delayed retry receipt failed for %s/%s from %s: %v", info.Chat, info.ID, info.Sender, err)
+	}
+}
+
+func (cli *Client) finishDelayedRetryReceipt(key messageRetryKey, pending chan struct{}) {
+	cli.messageRetriesLock.Lock()
+	defer cli.messageRetriesLock.Unlock()
+	state := cli.messageRetryStates[key]
+	if state.pending == pending {
+		close(pending)
+		state.pending = nil
+		cli.messageRetryStates[key] = state
+	}
+}
+
+func (cli *Client) cancelDelayedRetryReceipt(info *types.MessageInfo) {
+	key := messageRetryKeyFromInfo(info)
+	cli.messageRetriesLock.Lock()
+	defer cli.messageRetriesLock.Unlock()
+	state, found := cli.messageRetryStates[key]
+	if !found {
+		return
+	}
+	if state.pending != nil {
+		close(state.pending)
+		state.pending = nil
+	}
+	state.resolved = true
+	cli.messageRetryStates[key] = state
+}
+
+// Phone copies identify the author without a device number. Limit the match to
+// the same chat, message ID and author so unrelated messages remain independent.
+func (cli *Client) cancelDelayedRetryReceiptFromPhone(info *types.MessageInfo) {
+	cli.messageRetriesLock.Lock()
+	defer cli.messageRetriesLock.Unlock()
+	for key, state := range cli.messageRetryStates {
+		sender := key.sender.ToNonAD()
+		if key.chat != info.Chat || key.messageID != info.ID ||
+			(sender != info.Sender.ToNonAD() && (info.SenderAlt.IsEmpty() || sender != info.SenderAlt.ToNonAD())) {
+			continue
+		}
+		if state.pending != nil {
+			close(state.pending)
+			state.pending = nil
+		}
+		state.resolved = true
+		cli.messageRetryStates[key] = state
+	}
+}
+
+func (cli *Client) clearDelayedRetryReceipts() {
+	cli.messageRetriesLock.Lock()
+	defer cli.messageRetriesLock.Unlock()
+	for key, state := range cli.messageRetryStates {
+		if state.pending != nil {
+			close(state.pending)
+			state.pending = nil
+			cli.messageRetryStates[key] = state
+		}
+	}
 }

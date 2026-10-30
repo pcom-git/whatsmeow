@@ -116,9 +116,17 @@ type Client struct {
 	ManualHistorySyncDownload       bool
 	DisableManualHistorySyncReceipt bool
 
-	uploadPreKeysLock sync.Mutex
-	lastPreKeyUpload  time.Time
-	PreKeysUploaded   *exsync.Event
+	uploadPreKeysLock      preKeyMutex
+	lastPreKeyUpload       time.Time
+	PreKeysUploaded        *exsync.Event
+	preKeyHealthLock       preKeyMutex
+	lastPreKeyCheck        time.Time
+	preKeyCheckErr         error
+	preKeyCheckOnFailure   bool
+	preKeyRepairPending    bool
+	preKeyReplenishPending bool
+	preKeyRecoveryActive   bool
+	preKeyRecoveryID       uint64
 
 	mediaConnCache *MediaConn
 	mediaConnLock  sync.Mutex
@@ -139,6 +147,7 @@ type Client struct {
 	eventHandlersLock    sync.RWMutex
 
 	messageRetries     map[messageRetryKey]int
+	messageRetryStates map[messageRetryKey]retryReceiptState
 	messageRetriesLock sync.Mutex
 	retryLocks         [retryLockCount]sync.Mutex
 	retrySema          *semaphore.Weighted
