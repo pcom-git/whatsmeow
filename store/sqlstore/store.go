@@ -994,7 +994,8 @@ func (s *SQLStore) PutContactName(ctx context.Context, user types.JID, firstName
 	return nil
 }
 
-const contactBatchSize = 300
+// Each contact uses four parameters plus one shared our_jid: 1 + 4*200 = 801 < 999.
+const contactBatchSize = 200
 
 func (s *SQLStore) PutAllContactNames(ctx context.Context, contacts []store.ContactEntry) error {
 	if len(contacts) == 0 {
@@ -1443,7 +1444,24 @@ const (
 	deleteNCTSaltQuery = `DELETE FROM whatsmeow_nct_salt WHERE our_jid=$1`
 )
 
+// Each token uses four parameters plus one shared our_jid: 1 + 4*200 = 801 < 999.
+const privacyTokenBatchSize = 200
+
 func (s *SQLStore) PutPrivacyTokens(ctx context.Context, tokens ...store.PrivacyToken) error {
+	if len(tokens) == 0 {
+		return nil
+	}
+	return s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
+		for batch := range slices.Chunk(tokens, privacyTokenBatchSize) {
+			if err := s.putPrivacyTokens(ctx, batch); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func (s *SQLStore) putPrivacyTokens(ctx context.Context, tokens []store.PrivacyToken) error {
 	args := make([]any, 1+len(tokens)*4)
 	placeholders := make([]string, len(tokens))
 	args[0] = s.JID
