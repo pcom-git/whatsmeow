@@ -13,6 +13,8 @@ import (
 	"fmt"
 	"slices"
 
+	"time"
+
 	"go.mau.fi/util/exslices"
 
 	waBinary "go.mau.fi/whatsmeow/binary"
@@ -576,6 +578,18 @@ func (cli *Client) GetJoinedGroups(ctx context.Context) ([]*types.GroupInfo, err
 	if err != nil {
 		cli.Log.Warnf("Failed to store redacted phones from joined groups: %v", err)
 	}
+	if cli.Store.Groups != nil {
+		err = cli.Store.Groups.PutJoinedGroupsSnapshot(ctx, infos, time.Now())
+		if err != nil {
+			cli.Log.Warnf("Failed to store joined groups snapshot: %v", err)
+		} else {
+			for _, info := range infos {
+				if info != nil && (info.ParticipantCount == 0 || len(info.Participants) == info.ParticipantCount) {
+					cli.clearGroupPermissionDirty(info.JID)
+				}
+			}
+		}
+	}
 	return infos, nil
 }
 
@@ -627,6 +641,58 @@ func (cli *Client) GetGroupInfo(ctx context.Context, jid types.JID) (*types.Grou
 	return cli.getGroupInfo(ctx, jid, true)
 }
 
+// GetStoredGroupListPage returns a page of locally stored group metadata without making network requests.
+func (cli *Client) GetStoredGroupListPage(ctx context.Context, opts store.GroupListPageOptions) (store.GroupListPage, error) {
+	if cli.Store == nil || cli.Store.Groups == nil {
+		return store.GroupListPage{}, fmt.Errorf("group store is nil")
+	}
+	return cli.Store.Groups.GetGroupListPage(ctx, opts)
+}
+
+// GetStoredGroup returns locally stored metadata for one group without making network requests.
+func (cli *Client) GetStoredGroup(ctx context.Context, groupJID types.JID) (*store.GroupListPageEntry, error) {
+	if cli.Store == nil || cli.Store.Groups == nil {
+		return nil, fmt.Errorf("group store is nil")
+	}
+	return cli.Store.Groups.GetGroup(ctx, groupJID)
+}
+
+// GetStoredGroupMemberListPage returns a page of stored group members. The first
+// page transparently refreshes a missing or older-than-60-seconds complete
+// snapshot from WhatsApp, with a 10-second timeout and stale-cache fallback.
+func (cli *Client) GetStoredGroupMemberListPage(ctx context.Context, opts store.GroupMemberListPageOptions) (store.GroupMemberListPage, error) {
+	if cli.Store == nil || cli.Store.Groups == nil {
+		return store.GroupMemberListPage{}, fmt.Errorf("group store is nil")
+	}
+	return cli.getGroupMemberListPageWithRefresh(ctx, opts)
+}
+
+func groupInfoEventToStore(evt *events.GroupInfo) *store.GroupInfoEvent {
+	if evt == nil {
+		return nil
+	}
+	return &store.GroupInfoEvent{
+		JID:                    evt.JID,
+		Sender:                 evt.Sender,
+		SenderPN:               evt.SenderPN,
+		Timestamp:              evt.Timestamp,
+		Name:                   evt.Name,
+		Topic:                  evt.Topic,
+		Locked:                 evt.Locked,
+		Announce:               evt.Announce,
+		Ephemeral:              evt.Ephemeral,
+		MembershipApprovalMode: evt.MembershipApprovalMode,
+		Delete:                 evt.Delete,
+		ParticipantVersionID:   evt.ParticipantVersionID,
+		Join:                   evt.Join,
+		Leave:                  evt.Leave,
+		Promote:                evt.Promote,
+		Demote:                 evt.Demote,
+		Suspended:              evt.Suspended,
+		Unsuspended:            evt.Unsuspended,
+	}
+}
+
 func (cli *Client) cacheGroupInfo(groupInfo *types.GroupInfo, lock bool) ([]store.LIDMapping, []store.RedactedPhoneEntry) {
 	participants := make([]types.JID, len(groupInfo.Participants))
 	lidPairs := make([]store.LIDMapping, len(groupInfo.Participants))
@@ -665,6 +731,10 @@ func (cli *Client) cacheGroupInfo(groupInfo *types.GroupInfo, lock bool) ([]stor
 }
 
 func (cli *Client) getGroupInfo(ctx context.Context, jid types.JID, lockParticipantCache bool) (*types.GroupInfo, error) {
+	return cli.getGroupInfoWithSnapshotRequirement(ctx, jid, lockParticipantCache, false)
+}
+
+func (cli *Client) getGroupInfoWithSnapshotRequirement(ctx context.Context, jid types.JID, lockParticipantCache, requireCompleteSnapshot bool) (*types.GroupInfo, error) {
 	res, err := cli.sendGroupIQ(ctx, iqGet, jid, waBinary.Node{
 		Tag:   "query",
 		Attrs: waBinary.Attrs{"request": "interactive"},
@@ -685,6 +755,14 @@ func (cli *Client) getGroupInfo(ctx context.Context, jid types.JID, lockParticip
 	if err != nil {
 		return groupInfo, err
 	}
+	if requireCompleteSnapshot && groupInfo.ParticipantCount > 0 && len(groupInfo.Participants) != groupInfo.ParticipantCount {
+		return groupInfo, fmt.Errorf(
+			"incomplete participant snapshot for %s: received %d of %d participants",
+			jid,
+			len(groupInfo.Participants),
+			groupInfo.ParticipantCount,
+		)
+	}
 	lidPairs, redactedPhones := cli.cacheGroupInfo(groupInfo, lockParticipantCache)
 	err = cli.Store.LIDs.PutManyLIDMappings(ctx, lidPairs)
 	if err != nil {
@@ -693,6 +771,19 @@ func (cli *Client) getGroupInfo(ctx context.Context, jid types.JID, lockParticip
 	err = cli.Store.Contacts.PutManyRedactedPhones(ctx, redactedPhones)
 	if err != nil {
 		cli.Log.Warnf("Failed to store redacted phones for members of %s: %v", jid, err)
+	}
+	if cli.Store.Groups != nil {
+		err = cli.Store.Groups.PutGroupInfoSnapshot(ctx, groupInfo, time.Now())
+		if err != nil {
+			if requireCompleteSnapshot {
+				return groupInfo, fmt.Errorf("failed to store group info snapshot for %s: %w", jid, err)
+			}
+			cli.Log.Warnf("Failed to store group info snapshot for %s: %v", jid, err)
+		} else if requireCompleteSnapshot {
+			cli.clearGroupPermissionDirty(jid)
+		}
+	} else if requireCompleteSnapshot {
+		return groupInfo, fmt.Errorf("group store is nil")
 	}
 	return groupInfo, nil
 }

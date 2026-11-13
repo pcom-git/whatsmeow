@@ -33,6 +33,8 @@ var NoopDevice = &Device{
 	AppStateKeys:  nilStore,
 	AppState:      nilStore,
 	Contacts:      nilStore,
+	Groups:        nilStore,
+	Labels:        nilStore,
 	ChatSettings:  nilStore,
 	MsgSecrets:    nilStore,
 	PrivacyTokens: nilStore,
@@ -44,6 +46,7 @@ var NoopDevice = &Device{
 
 var _ AllStores = (*NoopStore)(nil)
 var _ DeviceContainer = (*NoopStore)(nil)
+var _ PreKeySyncStore = (*NoopStore)(nil)
 
 func (n *NoopStore) PutIdentity(ctx context.Context, address string, key [32]byte) error {
 	return n.Error
@@ -117,6 +120,26 @@ func (n *NoopStore) UploadedPreKeyCount(ctx context.Context) (int, error) {
 	return 0, n.Error
 }
 
+func (n *NoopStore) UploadedPreKeyIDs(ctx context.Context) ([]uint32, error) {
+	return nil, n.Error
+}
+
+func (n *NoopStore) PreKeyIDs(ctx context.Context) ([]uint32, error) {
+	return nil, n.Error
+}
+
+func (n *NoopStore) MarkPreKeysAsUploadedIDs(ctx context.Context, ids []uint32) error {
+	return n.Error
+}
+
+func (n *NoopStore) SyncUploadedPreKeyIDs(ctx context.Context, ids []uint32) error {
+	return n.Error
+}
+
+func (n *NoopStore) ClearPreKeys(ctx context.Context) error {
+	return n.Error
+}
+
 func (n *NoopStore) PutSenderKey(ctx context.Context, group, user string, session []byte) error {
 	return n.Error
 }
@@ -173,7 +196,7 @@ func (n *NoopStore) PutBusinessName(ctx context.Context, user types.JID, busines
 	return false, "", n.Error
 }
 
-func (n *NoopStore) PutContactName(ctx context.Context, user types.JID, fullName, firstName string) error {
+func (n *NoopStore) PutContactName(ctx context.Context, user types.JID, firstName, fullName string, isAddContact bool) error {
 	return n.Error
 }
 
@@ -191,6 +214,121 @@ func (n *NoopStore) GetContact(ctx context.Context, user types.JID) (types.Conta
 
 func (n *NoopStore) GetAllContacts(ctx context.Context) (map[types.JID]types.ContactInfo, error) {
 	return nil, n.Error
+}
+
+func (n *NoopStore) GetContactListPage(ctx context.Context, options ContactListPageOptions) (ContactListPage, error) {
+	if options.Keyword != "" {
+		return ContactListPage{
+			List:  []ContactListPageEntry{},
+			Page:  1,
+			Total: 0,
+		}, nil
+	}
+	if options.Page <= 0 {
+		options.Page = 1
+	}
+	if options.PageSize <= 0 {
+		options.PageSize = 50
+	} else if options.PageSize > 500 {
+		options.PageSize = 500
+	}
+	return ContactListPage{
+		List:     []ContactListPageEntry{},
+		Page:     options.Page,
+		PageSize: options.PageSize,
+	}, nil
+}
+
+func (n *NoopStore) PutJoinedGroupsSnapshot(ctx context.Context, groups []*types.GroupInfo, syncedAt time.Time) error {
+	return n.Error
+}
+
+func (n *NoopStore) PutGroupInfoSnapshot(ctx context.Context, group *types.GroupInfo, syncedAt time.Time) error {
+	return n.Error
+}
+
+func (n *NoopStore) PutGroupInfoEvent(ctx context.Context, evt *GroupInfoEvent) error {
+	return n.Error
+}
+
+func (n *NoopStore) GetGroupListPage(ctx context.Context, options GroupListPageOptions) (GroupListPage, error) {
+	if options.Page <= 0 {
+		options.Page = 1
+	}
+	if options.PageSize <= 0 {
+		options.PageSize = 50
+	} else if options.PageSize > 500 {
+		options.PageSize = 500
+	}
+	return GroupListPage{
+		List:     []GroupListPageEntry{},
+		Page:     options.Page,
+		PageSize: options.PageSize,
+	}, nil
+}
+
+func (n *NoopStore) GetGroup(ctx context.Context, groupJID types.JID) (*GroupListPageEntry, error) {
+	return nil, nil
+}
+
+func (n *NoopStore) GetGroupMemberListPage(ctx context.Context, options GroupMemberListPageOptions) (GroupMemberListPage, error) {
+	if options.Page <= 0 {
+		options.Page = 1
+	}
+	if options.PageSize <= 0 {
+		options.PageSize = 50
+	} else if options.PageSize > 500 {
+		options.PageSize = 500
+	}
+	return GroupMemberListPage{
+		List:     []GroupMemberListPageEntry{},
+		Page:     options.Page,
+		PageSize: options.PageSize,
+	}, nil
+}
+
+func (n *NoopStore) PutLabel(ctx context.Context, label LabelInfo) error {
+	return n.Error
+}
+
+func (n *NoopStore) PutLabelMember(ctx context.Context, member LabelMemberInfo) error {
+	return n.Error
+}
+
+func (n *NoopStore) ReplaceFavoriteMembers(ctx context.Context, members []types.JID, ts time.Time, fromFullSync bool) error {
+	return n.Error
+}
+
+func (n *NoopStore) GetLabels(ctx context.Context, options LabelListPageOptions) (LabelListPage, error) {
+	if options.Page <= 0 {
+		options.Page = 1
+	}
+	if options.PageSize <= 0 {
+		options.PageSize = 50
+	} else if options.PageSize > 500 {
+		options.PageSize = 500
+	}
+	return LabelListPage{
+		List:     []LabelInfo{},
+		Page:     options.Page,
+		PageSize: options.PageSize,
+	}, nil
+}
+
+func (n *NoopStore) GetLabelMembers(ctx context.Context, labelID string, options LabelMemberListPageOptions) (LabelMemberListPage, error) {
+	if options.Page <= 0 {
+		options.Page = 1
+	}
+	if options.PageSize <= 0 {
+		options.PageSize = 50
+	} else if options.PageSize > 500 {
+		options.PageSize = 500
+	}
+	return LabelMemberListPage{
+		List:     []LabelMemberInfo{},
+		Page:     options.Page,
+		PageSize: options.PageSize,
+	}, nil
 }
 
 func (n *NoopStore) PutMutedUntil(ctx context.Context, chat types.JID, mutedUntil time.Time) error {

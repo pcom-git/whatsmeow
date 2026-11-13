@@ -37,6 +37,59 @@ type PatchInfo struct {
 	Mutations []MutationInfo
 }
 
+// ContactInfo contains the data needed to add or update a WhatsApp contact.
+type ContactInfo struct {
+	PhoneJID                 types.JID
+	LIDJID                   types.JID
+	Username                 string
+	FirstName                string
+	FullName                 string
+	SaveOnPrimaryAddressbook bool
+}
+
+// BuildContact builds an app state patch for adding or updating a contact.
+func BuildContact(info ContactInfo) PatchInfo {
+	indexJID := info.PhoneJID
+	if indexJID.IsEmpty() {
+		indexJID = info.LIDJID
+	}
+	value := &waSyncAction.SyncActionValue{}
+	if info.PhoneJID.IsEmpty() {
+		action := &waSyncAction.LidContactAction{
+			FullName:  proto.String(info.FullName),
+			FirstName: proto.String(info.FirstName),
+		}
+		if info.Username != "" {
+			action.Username = proto.String(info.Username)
+		}
+		value.LidContactAction = action
+	} else {
+		action := &waSyncAction.ContactAction{
+			FullName:                 proto.String(info.FullName),
+			FirstName:                proto.String(info.FirstName),
+			LidJID:                   proto.String(info.LIDJID.String()),
+			SaveOnPrimaryAddressbook: proto.Bool(info.SaveOnPrimaryAddressbook),
+			PnJID:                    proto.String(info.PhoneJID.String()),
+		}
+		if info.Username != "" {
+			action.Username = proto.String(info.Username)
+		}
+		value.ContactAction = action
+	}
+	indexType := IndexContact
+	if info.PhoneJID.IsEmpty() {
+		indexType = IndexLIDContact
+	}
+	return PatchInfo{
+		Type: WAPatchCriticalUnblockLow,
+		Mutations: []MutationInfo{{
+			Index:   []string{indexType, indexJID.String()},
+			Version: 2,
+			Value:   value,
+		}},
+	}
+}
+
 // BuildMute builds an app state patch for muting or unmuting a chat.
 //
 // If mute is true and the mute duration is zero, the chat is muted forever.
@@ -140,6 +193,27 @@ func BuildMarkChatAsRead(target types.JID, read bool, lastMessageTimestamp time.
 	}
 }
 
+// BuildNoteEdit builds an app state patch for editing a chat note.
+func BuildNoteEdit(target types.JID, note string) PatchInfo {
+	noteType := waSyncAction.NoteEditAction_UNSTRUCTURED
+	return PatchInfo{
+		Type: WAPatchRegularLow,
+		Mutations: []MutationInfo{{
+			Index:   []string{IndexNoteEdit, target.String()},
+			Version: 5,
+			Value: &waSyncAction.SyncActionValue{
+				NoteEditAction: &waSyncAction.NoteEditAction{
+					Type:                noteType.Enum(),
+					ChatJID:             proto.String(target.String()),
+					CreatedAt:           proto.Int64(time.Now().UnixMilli()),
+					Deleted:             proto.Bool(false),
+					UnstructuredContent: proto.String(note),
+				},
+			},
+		}},
+	}
+}
+
 func newLabelChatMutation(target types.JID, labelID string, labeled bool) MutationInfo {
 	return MutationInfo{
 		Index:   []string{IndexLabelAssociationChat, labelID, target.String()},
@@ -205,6 +279,38 @@ func BuildLabelEdit(labelID string, labelName string, labelColor int32, deleted 
 		Mutations: []MutationInfo{
 			newLabelEditMutation(labelID, labelName, labelColor, deleted),
 		},
+	}
+}
+
+// BuildLabelEditFull builds an app state patch for creating or editing a label from a full
+// LabelEditAction value. Unlike BuildLabelEdit, this lets the caller set fields that the simple
+// builder doesn't expose, such as the label type (e.g. CUSTOM), isActive, predefinedID and orderIndex.
+//
+// This is primarily used by the high-level Client.CreateLabel/EditLabel/DeleteLabel helpers.
+func BuildLabelEditFull(labelID string, action *waSyncAction.LabelEditAction) PatchInfo {
+	return PatchInfo{
+		Type: WAPatchRegular,
+		Mutations: []MutationInfo{{
+			Index:   []string{IndexLabelEdit, labelID},
+			Version: 3,
+			Value: &waSyncAction.SyncActionValue{
+				LabelEditAction: action,
+			},
+		}},
+	}
+}
+
+// BuildLabelChatBatch builds a single app state patch that labels or unlabels multiple chats
+// (contacts or groups) with the same label. This lets callers add or remove many members in one
+// request instead of one patch per chat.
+func BuildLabelChatBatch(targets []types.JID, labelID string, labeled bool) PatchInfo {
+	mutations := make([]MutationInfo, 0, len(targets))
+	for _, target := range targets {
+		mutations = append(mutations, newLabelChatMutation(target, labelID, labeled))
+	}
+	return PatchInfo{
+		Type:      WAPatchRegular,
+		Mutations: mutations,
 	}
 }
 

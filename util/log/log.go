@@ -9,7 +9,10 @@ package waLog
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -53,6 +56,13 @@ var levelToInt = map[string]int{
 	"ERROR": 3,
 }
 
+var fileLog = struct {
+	sync.Mutex
+	file   *os.File
+	date   string
+	warned bool
+}{}
+
 func (s *stdoutLogger) outputf(level, msg string, args ...any) {
 	if levelToInt[level] < s.min {
 		return
@@ -62,7 +72,55 @@ func (s *stdoutLogger) outputf(level, msg string, args ...any) {
 		colorStart = colors[level]
 		colorReset = "\033[0m"
 	}
-	fmt.Printf("%s%s [%s %s] %s%s\n", time.Now().Format("15:04:05.000"), colorStart, s.mod, level, fmt.Sprintf(msg, args...), colorReset)
+	now := time.Now()
+	message := fmt.Sprintf(msg, args...)
+	timestamp := now.Format("15:04:05.000")
+	fmt.Printf("%s%s [%s %s] %s%s\n", timestamp, colorStart, s.mod, level, message, colorReset)
+	writeLogFile(now, fmt.Sprintf("%s [%s %s] %s\n", timestamp, s.mod, level, message))
+}
+
+func writeLogFile(now time.Time, line string) {
+	fileLog.Lock()
+	defer fileLog.Unlock()
+
+	file, err := getLogFile(now)
+	if err != nil {
+		if !fileLog.warned {
+			fmt.Fprintf(os.Stderr, "failed to open whatsmeow log file: %v\n", err)
+			fileLog.warned = true
+		}
+		return
+	}
+	if _, err = file.WriteString(line); err != nil && !fileLog.warned {
+		fmt.Fprintf(os.Stderr, "failed to write whatsmeow log file: %v\n", err)
+		fileLog.warned = true
+	}
+}
+
+func getLogFile(now time.Time) (*os.File, error) {
+	date := now.Format("20060102")
+	if fileLog.file != nil && fileLog.date == date {
+		return fileLog.file, nil
+	}
+	if fileLog.file != nil {
+		_ = fileLog.file.Close()
+		fileLog.file = nil
+		fileLog.date = ""
+	}
+
+	logDir := filepath.Join(".", "runtime", "logs")
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		return nil, err
+	}
+	logPath := filepath.Join(logDir, fmt.Sprintf("whatsmeow_log_%s.txt", date))
+	file, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return nil, err
+	}
+
+	fileLog.file = file
+	fileLog.date = date
+	return file, nil
 }
 
 func (s *stdoutLogger) Errorf(msg string, args ...any) { s.outputf("ERROR", msg, args...) }

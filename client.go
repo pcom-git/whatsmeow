@@ -60,6 +60,13 @@ type deviceCache struct {
 	dhash   string
 }
 
+type handlerQueues struct {
+	message chan *waBinary.Node
+	receipt chan *waBinary.Node
+	status  chan *waBinary.Node
+	regular chan *waBinary.Node
+}
+
 // Client contains everything necessary to connect to and interact with the WhatsApp web API.
 type Client struct {
 	Store   *store.Device
@@ -95,12 +102,13 @@ type Client struct {
 	sendActiveReceipts atomic.Uint32
 
 	// EmitAppStateEventsOnFullSync can be set to true if you want to get app state events emitted
-	// even when re-syncing the whole state.
+	// even when re-syncing the whole state. PushNameSetting is always emitted during full sync so
+	// callers can detect when the current user's push name becomes available.
 	EmitAppStateEventsOnFullSync bool
 	AppStateDebugLogs            bool
 
 	AutomaticMessageRerequestFromPhone bool
-	pendingPhoneRerequests             map[types.MessageID]context.CancelFunc
+	pendingPhoneRerequests             map[messageRetryKey]phoneRerequestState
 	pendingPhoneRerequestsLock         sync.RWMutex
 
 	appStateProc     *appstate.Processor
@@ -112,9 +120,17 @@ type Client struct {
 	ManualHistorySyncDownload       bool
 	DisableManualHistorySyncReceipt bool
 
-	uploadPreKeysLock sync.Mutex
-	lastPreKeyUpload  time.Time
-	PreKeysUploaded   *exsync.Event
+	uploadPreKeysLock      preKeyMutex
+	lastPreKeyUpload       time.Time
+	PreKeysUploaded        *exsync.Event
+	preKeyHealthLock       preKeyMutex
+	lastPreKeyCheck        time.Time
+	preKeyCheckErr         error
+	preKeyCheckOnFailure   bool
+	preKeyRepairPending    bool
+	preKeyReplenishPending bool
+	preKeyRecoveryActive   bool
+	preKeyRecoveryID       uint64
 
 	mediaConnCache *MediaConn
 	mediaConnLock  sync.Mutex
@@ -122,12 +138,22 @@ type Client struct {
 	responseWaiters     map[string]chan<- *waBinary.Node
 	responseWaitersLock sync.Mutex
 
-	nodeHandlers      map[string]nodeHandler
-	eventHandlers     []wrappedEventHandler
-	eventHandlersLock sync.RWMutex
+	nodeHandlers         map[string]nodeHandler
+	handlerQueue         chan *waBinary.Node
+	messageHandlerQueue  chan *waBinary.Node
+	receiptHandlerQueue  chan *waBinary.Node
+	statusHandlerQueue   chan *waBinary.Node
+	regularHandlerQueue  chan *waBinary.Node
+	eventHandlers        []wrappedEventHandler
+	messageEventHandlers []wrappedEventHandler
+	receiptEventHandlers []wrappedEventHandler
+	regularEventHandlers []wrappedEventHandler
+	eventHandlersLock    sync.RWMutex
 
-	messageRetries     map[string]int
+	messageRetries     map[messageRetryKey]int
+	messageRetryStates map[messageRetryKey]retryReceiptState
 	messageRetriesLock sync.Mutex
+	retryLocks         [retryLockCount]sync.Mutex
 	retrySema          *semaphore.Weighted
 
 	incomingRetryRequestCounter     map[incomingRetryKey]int
@@ -148,6 +174,8 @@ type Client struct {
 
 	groupCache           map[types.JID]*groupMetaCache
 	groupCacheLock       sync.Mutex
+	groupPermissionDirty map[types.JID]struct{}
+	groupPermissionLock  sync.RWMutex
 	userDevicesCache     map[types.JID]deviceCache
 	userDevicesCacheLock sync.Mutex
 
@@ -274,29 +302,35 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 		Transport: (http.DefaultTransport.(*http.Transport)).Clone(),
 	}
 	cli := &Client{
-		mediaHTTP:          ptr.Clone(baseHTTPClient),
-		websocketHTTP:      ptr.Clone(baseHTTPClient),
-		preLoginHTTP:       ptr.Clone(baseHTTPClient),
-		Store:              deviceStore,
-		Log:                log,
-		recvLog:            log.Sub("Recv"),
-		sendLog:            log.Sub("Send"),
-		uniqueID:           fmt.Sprintf("%d.%d-", uniqueIDPrefix[0], uniqueIDPrefix[1]),
-		responseWaiters:    make(map[string]chan<- *waBinary.Node),
-		eventHandlers:      make([]wrappedEventHandler, 0, 1),
-		messageRetries:     make(map[string]int),
-		appStateProc:       appstate.NewProcessor(deviceStore, log.Sub("AppState")),
-		socketWait:         make(chan struct{}),
-		expectedDisconnect: exsync.NewEvent(),
-		PreKeysUploaded:    exsync.NewEvent(),
+		mediaHTTP:           ptr.Clone(baseHTTPClient),
+		websocketHTTP:       ptr.Clone(baseHTTPClient),
+		preLoginHTTP:        ptr.Clone(baseHTTPClient),
+		Store:               deviceStore,
+		Log:                 log,
+		recvLog:             log.Sub("Recv"),
+		sendLog:             log.Sub("Send"),
+		uniqueID:            fmt.Sprintf("%d.%d-", uniqueIDPrefix[0], uniqueIDPrefix[1]),
+		responseWaiters:     make(map[string]chan<- *waBinary.Node),
+		eventHandlers:       make([]wrappedEventHandler, 0, 1),
+		messageRetries:      make(map[messageRetryKey]int),
+		handlerQueue:        make(chan *waBinary.Node, handlerQueueSize),
+		messageHandlerQueue: make(chan *waBinary.Node, handlerQueueSize),
+		receiptHandlerQueue: make(chan *waBinary.Node, handlerQueueSize),
+		statusHandlerQueue:  make(chan *waBinary.Node, handlerQueueSize),
+		regularHandlerQueue: make(chan *waBinary.Node, handlerQueueSize),
+		appStateProc:        appstate.NewProcessor(deviceStore, log.Sub("AppState")),
+		socketWait:          make(chan struct{}),
+		expectedDisconnect:  exsync.NewEvent(),
+		PreKeysUploaded:     exsync.NewEvent(),
 
 		incomingRetryRequestCounter: make(map[incomingRetryKey]int),
 
 		historySyncNotifications: make(chan *waE2E.HistorySyncNotification, 32),
 
-		tcTokenSenderTS:  make(map[types.JID]time.Time),
-		groupCache:       make(map[types.JID]*groupMetaCache),
-		userDevicesCache: make(map[types.JID]deviceCache),
+		tcTokenSenderTS:      make(map[types.JID]time.Time),
+		groupCache:           make(map[types.JID]*groupMetaCache),
+		groupPermissionDirty: make(map[types.JID]struct{}),
+		userDevicesCache:     make(map[types.JID]deviceCache),
 
 		recentMessagesMap:      make(map[recentMessageKey]RecentMessage, recentMessagesSize),
 		sessionRecreateHistory: make(map[types.JID]time.Time),
@@ -304,7 +338,7 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 		appStateKeyRequests:    make(map[string]time.Time),
 		appStateBackoff:        make(map[appstate.WAPatchName]time.Time),
 
-		pendingPhoneRerequests: make(map[types.MessageID]context.CancelFunc),
+		pendingPhoneRerequests: make(map[messageRetryKey]phoneRerequestState),
 
 		EnableAutoReconnect: true,
 		AutoTrustIdentity:   true,
@@ -324,6 +358,7 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 		"chatstate":    cli.handleChatState,
 		"presence":     cli.handlePresence,
 		"notification": cli.handleNotification,
+		// "status":       cli.handleStatus,
 		"success":      cli.handleConnectSuccess,
 		"failure":      cli.handleConnectFailure,
 		"stream:error": cli.handleStreamError,
@@ -590,19 +625,28 @@ func (cli *Client) unlockedConnect(ctx context.Context) error {
 		fs.URL = cli.MessengerConfig.WebsocketURL
 		fs.HTTPHeaders.Set("Origin", cli.MessengerConfig.BaseURL)
 	}
-	var queue chan *waBinary.Node
+	handlerQueues := cli.resetHandlerQueues()
 	maps.Copy(fs.HTTPHeaders, cli.WebSocketHeaders)
 	if err := fs.Connect(ctx); err != nil {
 		fs.Close(0)
 		return err
-	} else if queue, err = cli.doHandshake(fs, *keys.NewKeyPair()); err != nil {
+	} else if _, err = cli.doHandshake(fs, *keys.NewKeyPair(), handlerQueues); err != nil {
 		fs.Close(0)
 		return fmt.Errorf("noise handshake failed: %w", err)
 	}
 	closeWait := make(chan struct{})
 	cli.handlerQueueWait = closeWait
+	var handlerQueueWait sync.WaitGroup
+	handlerQueueWait.Add(4)
 	go cli.keepAliveLoop(ctx, fs.Context())
-	go cli.handlerQueueLoop(ctx, fs.Context(), queue, closeWait)
+	go func() {
+		handlerQueueWait.Wait()
+		close(closeWait)
+	}()
+	go cli.namedHandlerQueueLoop(ctx, fs.Context(), "message", cli.messageHandlerQueue, &handlerQueueWait)
+	go cli.namedHandlerQueueLoop(ctx, fs.Context(), "receipt", cli.receiptHandlerQueue, &handlerQueueWait)
+	go cli.namedHandlerQueueLoop(ctx, fs.Context(), "status", cli.statusHandlerQueue, &handlerQueueWait)
+	go cli.namedHandlerQueueLoop(ctx, fs.Context(), "regular", cli.regularHandlerQueue, &handlerQueueWait)
 	return nil
 }
 
@@ -781,19 +825,20 @@ func (cli *Client) Logout(ctx context.Context) error {
 	return nil
 }
 
-// AddEventHandler registers a new function to receive all events emitted by this client.
+// AddEventHandler registers a new function to receive regular events emitted by this client.
 //
 // The returned integer is the event handler ID, which can be passed to RemoveEventHandler to remove it.
 //
-// All registered event handlers will receive all events. You should use a type switch statement to
-// filter the events you want:
+// Message and receipt events are dispatched through the dedicated handlers registered with
+// AddMessageEventHandler and AddReceiptEventHandler. Use a type switch statement to filter the regular
+// events you want:
 //
 //	func myEventHandler(evt any) {
 //		switch v := evt.(type) {
-//		case *events.Message:
-//			fmt.Println("Received a message!")
-//		case *events.Receipt:
-//			fmt.Println("Received a receipt!")
+//		case *events.Connected:
+//			fmt.Println("Connected!")
+//		case *events.StreamError:
+//			fmt.Println("Received a stream error!")
 //		}
 //	}
 //
@@ -820,9 +865,49 @@ func (cli *Client) AddEventHandler(handler EventHandler) uint32 {
 }
 
 func (cli *Client) AddEventHandlerWithSuccessStatus(handler EventHandlerWithSuccessStatus) uint32 {
+	return cli.addEventHandlerTo(&cli.eventHandlers, handler)
+}
+
+// AddMessageEventHandler registers a new function to receive message events emitted by this client.
+func (cli *Client) AddMessageEventHandler(handler EventHandler) uint32 {
+	return cli.AddMessageEventHandlerWithSuccessStatus(func(evt any) bool {
+		handler(evt)
+		return true
+	})
+}
+
+func (cli *Client) AddMessageEventHandlerWithSuccessStatus(handler EventHandlerWithSuccessStatus) uint32 {
+	return cli.addEventHandlerTo(&cli.messageEventHandlers, handler)
+}
+
+// AddReceiptEventHandler registers a new function to receive receipt events emitted by this client.
+func (cli *Client) AddReceiptEventHandler(handler EventHandler) uint32 {
+	return cli.AddReceiptEventHandlerWithSuccessStatus(func(evt any) bool {
+		handler(evt)
+		return true
+	})
+}
+
+func (cli *Client) AddReceiptEventHandlerWithSuccessStatus(handler EventHandlerWithSuccessStatus) uint32 {
+	return cli.addEventHandlerTo(&cli.receiptEventHandlers, handler)
+}
+
+// AddRegularEventHandler registers a new function to receive regular non-message and non-receipt events emitted by this client.
+func (cli *Client) AddRegularEventHandler(handler EventHandler) uint32 {
+	return cli.AddRegularEventHandlerWithSuccessStatus(func(evt any) bool {
+		handler(evt)
+		return true
+	})
+}
+
+func (cli *Client) AddRegularEventHandlerWithSuccessStatus(handler EventHandlerWithSuccessStatus) uint32 {
+	return cli.addEventHandlerTo(&cli.regularEventHandlers, handler)
+}
+
+func (cli *Client) addEventHandlerTo(handlers *[]wrappedEventHandler, handler EventHandlerWithSuccessStatus) uint32 {
 	nextID := atomic.AddUint32(&nextHandlerID, 1)
 	cli.eventHandlersLock.Lock()
-	cli.eventHandlers = append(cli.eventHandlers, wrappedEventHandler{handler, nextID})
+	*handlers = append(*handlers, wrappedEventHandler{handler, nextID})
 	cli.eventHandlersLock.Unlock()
 	return nextID
 }
@@ -842,19 +927,34 @@ func (cli *Client) AddEventHandlerWithSuccessStatus(handler EventHandlerWithSucc
 func (cli *Client) RemoveEventHandler(id uint32) bool {
 	cli.eventHandlersLock.Lock()
 	defer cli.eventHandlersLock.Unlock()
-	for index := range cli.eventHandlers {
-		if cli.eventHandlers[index].id == id {
-			if index == 0 {
-				cli.eventHandlers[0].fn = nil
-				cli.eventHandlers = cli.eventHandlers[1:]
-				return true
-			} else if index < len(cli.eventHandlers)-1 {
-				copy(cli.eventHandlers[index:], cli.eventHandlers[index+1:])
-			}
-			cli.eventHandlers[len(cli.eventHandlers)-1].fn = nil
-			cli.eventHandlers = cli.eventHandlers[:len(cli.eventHandlers)-1]
+	for _, handlers := range []*[]wrappedEventHandler{
+		&cli.eventHandlers,
+		&cli.messageEventHandlers,
+		&cli.receiptEventHandlers,
+		&cli.regularEventHandlers,
+	} {
+		if removeWrappedEventHandler(handlers, id) {
 			return true
 		}
+	}
+	return false
+}
+
+func removeWrappedEventHandler(handlers *[]wrappedEventHandler, id uint32) bool {
+	for index := range *handlers {
+		if (*handlers)[index].id != id {
+			continue
+		}
+		if index == 0 {
+			(*handlers)[0].fn = nil
+			*handlers = (*handlers)[1:]
+			return true
+		} else if index < len(*handlers)-1 {
+			copy((*handlers)[index:], (*handlers)[index+1:])
+		}
+		(*handlers)[len(*handlers)-1].fn = nil
+		*handlers = (*handlers)[:len(*handlers)-1]
+		return true
 	}
 	return false
 }
@@ -863,16 +963,29 @@ func (cli *Client) RemoveEventHandler(id uint32) bool {
 func (cli *Client) RemoveEventHandlers() {
 	cli.eventHandlersLock.Lock()
 	cli.eventHandlers = make([]wrappedEventHandler, 0, 1)
+	cli.messageEventHandlers = make([]wrappedEventHandler, 0, 1)
+	cli.receiptEventHandlers = make([]wrappedEventHandler, 0, 1)
+	cli.regularEventHandlers = make([]wrappedEventHandler, 0, 1)
 	cli.eventHandlersLock.Unlock()
 }
 
 func (cli *Client) makeFrameHandler(queue chan *waBinary.Node) func(ctx context.Context, data []byte) {
+	queues := handlerQueues{
+		message: queue,
+		receipt: queue,
+		status:  queue,
+		regular: queue,
+	}
+	return cli.makeFrameHandlerForQueues(queues)
+}
+
+func (cli *Client) makeFrameHandlerForQueues(queues handlerQueues) func(ctx context.Context, data []byte) {
 	return func(ctx context.Context, data []byte) {
-		cli.handleFrame(ctx, data, queue)
+		cli.handleFrame(ctx, data, queues)
 	}
 }
 
-func (cli *Client) handleFrame(ctx context.Context, data []byte, queue chan *waBinary.Node) {
+func (cli *Client) handleFrame(ctx context.Context, data []byte, queues handlerQueues) {
 	decompressed, err := waBinary.Unpack(data)
 	if err != nil {
 		cli.Log.Warnf("Failed to decompress frame: %v", err)
@@ -894,14 +1007,16 @@ func (cli *Client) handleFrame(ctx context.Context, data []byte, queue chan *waB
 	} else if cli.receiveResponse(ctx, node) {
 		// handled
 	} else if _, ok := cli.nodeHandlers[node.Tag]; ok {
+		handlerQueue := queues.queueForNode(node)
+		queueName := cli.handlerQueueNameForNode(node)
 		select {
-		case queue <- node:
+		case handlerQueue <- node:
 		case <-ctx.Done():
 		default:
-			cli.Log.Warnf("Handler queue is full, message ordering is no longer guaranteed")
+			cli.Log.Warnf("%s handler queue is full, message ordering is no longer guaranteed for %s", queueName, node.Tag)
 			go func() {
 				select {
-				case queue <- node:
+				case handlerQueue <- node:
 				case <-ctx.Done():
 				}
 			}()
@@ -911,33 +1026,87 @@ func (cli *Client) handleFrame(ctx context.Context, data []byte, queue chan *waB
 	}
 }
 
-func (cli *Client) handlerQueueLoop(evtCtx, connCtx context.Context, queue chan *waBinary.Node, closeWait chan struct{}) {
+func (cli *Client) handlerQueueLoop(evtCtx, connCtx context.Context) {
+	cli.namedHandlerQueueLoop(evtCtx, connCtx, "regular", cli.regularHandlerQueue, nil)
+}
+
+func (cli *Client) resetHandlerQueues() handlerQueues {
+	queues := handlerQueues{
+		message: make(chan *waBinary.Node, handlerQueueSize),
+		receipt: make(chan *waBinary.Node, handlerQueueSize),
+		status:  make(chan *waBinary.Node, handlerQueueSize),
+		regular: make(chan *waBinary.Node, handlerQueueSize),
+	}
+	cli.messageHandlerQueue = queues.message
+	cli.receiptHandlerQueue = queues.receipt
+	cli.statusHandlerQueue = queues.status
+	cli.regularHandlerQueue = queues.regular
+	return queues
+}
+
+func (cli *Client) handlerQueueForNode(node *waBinary.Node) chan *waBinary.Node {
+	return handlerQueues{
+		message: cli.messageHandlerQueue,
+		receipt: cli.receiptHandlerQueue,
+		status:  cli.statusHandlerQueue,
+		regular: cli.regularHandlerQueue,
+	}.queueForNode(node)
+}
+
+func (queues handlerQueues) queueForNode(node *waBinary.Node) chan *waBinary.Node {
+	if node != nil && (node.Tag == "message" || node.Tag == "appdata") {
+		return queues.message
+	}
+	if node != nil && node.Tag == "receipt" {
+		return queues.receipt
+	}
+	if node != nil && node.Tag == "status" {
+		return queues.status
+	}
+	return queues.regular
+}
+
+func (cli *Client) handlerQueueNameForNode(node *waBinary.Node) string {
+	if node != nil && (node.Tag == "message" || node.Tag == "appdata") {
+		return "message"
+	}
+	if node != nil && node.Tag == "receipt" {
+		return "receipt"
+	}
+	if node != nil && node.Tag == "status" {
+		return "status"
+	}
+	return "regular"
+}
+
+func (cli *Client) namedHandlerQueueLoop(evtCtx, connCtx context.Context, queueName string, handlerQueue chan *waBinary.Node, waitGroup *sync.WaitGroup) {
+	if waitGroup != nil {
+		defer waitGroup.Done()
+	}
 	ticker := time.NewTicker(30 * time.Second)
 	ticker.Stop()
-	cli.Log.Debugf("Starting handler queue loop")
+	cli.Log.Debugf("Starting %s handler queue loop", queueName)
 	defer func() {
 	Loop:
 		for {
 			select {
-			case node := <-queue:
+			case node := <-handlerQueue:
 				// Make sure stream errors are handled even after disconnection so the appropriate auto-reconnect is done.
-				// Everything else
 				if node.Tag == "stream:error" {
-					cli.Log.Debugf("Handling stream:error node in handler queue loop after context cancellation")
+					cli.Log.Debugf("Handling stream:error node in %s handler queue loop after context cancellation", queueName)
 					cli.handleStreamError(evtCtx, node)
 				}
 			default:
 				break Loop
 			}
 		}
-		close(closeWait)
 	}()
 Loop:
 	for {
 		select {
-		case node := <-queue:
+		case node := <-handlerQueue:
 			if connCtx.Err() != nil {
-				cli.Log.Debugf("Closing handler queue loop before node handling")
+				cli.Log.Debugf("Closing %s handler queue loop before node handling", queueName)
 				return
 			}
 			doneChan := make(chan struct{})
@@ -947,7 +1116,7 @@ Loop:
 				duration := time.Since(start)
 				close(doneChan)
 				if duration > 5*time.Second {
-					cli.Log.Warnf("Node handling took %s for %s", duration, node)
+					cli.Log.Warnf("%s node handling took %s for %s", queueName, duration, node)
 				}
 			}()
 			ticker.Reset(30 * time.Second)
@@ -961,13 +1130,13 @@ Loop:
 					cli.Log.Warnf("Closing handler queue loop in the middle of handling %s", node)
 					return
 				case <-ticker.C:
-					cli.Log.Warnf("Node handling is taking long for %s (started %s ago)", node, time.Since(start))
+					cli.Log.Warnf("%s node handling is taking long for %s (started %s ago)", queueName, node, time.Since(start))
 				}
 			}
-			cli.Log.Warnf("Continuing handling of %s in background as it's taking too long", node)
+			cli.Log.Warnf("Continuing %s handling of %s in background as it's taking too long", queueName, node)
 			ticker.Stop()
 		case <-connCtx.Done():
-			cli.Log.Debugf("Closing handler queue loop")
+			cli.Log.Debugf("Closing %s handler queue loop", queueName)
 			return
 		}
 	}
@@ -999,6 +1168,22 @@ func (cli *Client) sendNode(ctx context.Context, node waBinary.Node) error {
 }
 
 func (cli *Client) dispatchEvent(evt any) (handlerFailed bool) {
+	return cli.dispatchRegularEvent(evt)
+}
+
+func (cli *Client) dispatchMessageEvent(evt any) (handlerFailed bool) {
+	return cli.dispatchEventToHandlers(evt, &cli.messageEventHandlers)
+}
+
+func (cli *Client) dispatchReceiptEvent(evt any) (handlerFailed bool) {
+	return cli.dispatchEventToHandlers(evt, &cli.receiptEventHandlers)
+}
+
+func (cli *Client) dispatchRegularEvent(evt any) (handlerFailed bool) {
+	return cli.dispatchEventToHandlers(evt, &cli.regularEventHandlers, &cli.eventHandlers)
+}
+
+func (cli *Client) dispatchEventToHandlers(evt any, handlerSets ...*[]wrappedEventHandler) (handlerFailed bool) {
 	cli.eventHandlersLock.RLock()
 	defer func() {
 		cli.eventHandlersLock.RUnlock()
@@ -1007,9 +1192,11 @@ func (cli *Client) dispatchEvent(evt any) (handlerFailed bool) {
 			cli.Log.Errorf("Event handler panicked while handling a %T: %v\n%s", evt, err, debug.Stack())
 		}
 	}()
-	for _, handler := range cli.eventHandlers {
-		if !handler.fn(evt) {
-			return true
+	for _, handlers := range handlerSets {
+		for _, handler := range *handlers {
+			if !handler.fn(evt) {
+				return true
+			}
 		}
 	}
 	return false

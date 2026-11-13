@@ -15,6 +15,8 @@ import (
 
 	"github.com/rs/zerolog"
 	"go.mau.fi/util/exslices"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 
 	"go.mau.fi/whatsmeow/appstate"
 	waBinary "go.mau.fi/whatsmeow/binary"
@@ -45,6 +47,10 @@ func (cli *Client) fetchAppState(ctx context.Context, name appstate.WAPatchName,
 	}
 	cli.appStateSyncLock.Lock()
 	defer cli.appStateSyncLock.Unlock()
+	return cli.fetchAppStateLocked(ctx, name, fullSync, onlyIfNotSynced)
+}
+
+func (cli *Client) fetchAppStateLocked(ctx context.Context, name appstate.WAPatchName, fullSync, onlyIfNotSynced bool) ([]any, error) {
 	if until := cli.appStateBackoff[name]; time.Now().Before(until) {
 		return nil, fmt.Errorf("%w: not fetching %s until %s", ErrAppStateRateLimited, name, until.Format(time.RFC3339))
 	}
@@ -69,10 +75,7 @@ func (cli *Client) fetchAppState(ctx context.Context, name appstate.WAPatchName,
 	hasMore := true
 	wantSnapshot := fullSync
 	var eventsToDispatch []any
-	eventsToDispatchPtr := &eventsToDispatch
-	if fullSync && !cli.EmitAppStateEventsOnFullSync {
-		eventsToDispatchPtr = nil
-	}
+	emitAllEvents := !fullSync || cli.EmitAppStateEventsOnFullSync
 	for hasMore {
 		patches, err := cli.fetchAppStatePatches(ctx, name, state.Version, wantSnapshot)
 		var iqErr *IQError
@@ -93,7 +96,7 @@ func (cli *Client) fetchAppState(ctx context.Context, name appstate.WAPatchName,
 		}
 		wantSnapshot = false
 		hasMore = patches.HasMorePatches
-		state, err = cli.applyAppStatePatches(ctx, name, state, patches, fullSync, eventsToDispatchPtr)
+		state, err = cli.applyAppStatePatchesWithPolicy(ctx, name, state, patches, fullSync, &eventsToDispatch, emitAllEvents)
 		if err != nil {
 			return nil, err
 		}
@@ -119,10 +122,7 @@ func (cli *Client) handleAppStateRecovery(
 		cli.Log.Warnf("Unexpected number of app state recovery results for %s: %d", reqID, len(result))
 	}
 	var eventsToDispatch []any
-	eventsToDispatchPtr := &eventsToDispatch
-	if !cli.EmitAppStateEventsOnFullSync {
-		eventsToDispatchPtr = nil
-	}
+	emitAllEvents := cli.EmitAppStateEventsOnFullSync
 	snapshot, err := appstate.ParseRecovery(result[0].GetSyncdSnapshotFatalRecoveryResponse())
 	if err != nil {
 		cli.Log.Warnf("Failed to parse app state recovery blob for %s: %v", reqID, err)
@@ -144,7 +144,7 @@ func (cli *Client) handleAppStateRecovery(
 		cli.Log.Warnf("Failed to parse app state recovery blob for %s: %v", reqID, err)
 		return true
 	}
-	err = cli.collectEventsToDispatch(ctx, name, mutations, true, eventsToDispatchPtr)
+	err = cli.collectEventsToDispatchWithPolicy(ctx, name, mutations, true, &eventsToDispatch, emitAllEvents)
 	if err != nil {
 		cli.Log.Warnf("Failed to collect app state events for %s: %v", reqID, err)
 		return true
@@ -168,6 +168,18 @@ func (cli *Client) applyAppStatePatches(
 	fullSync bool,
 	eventsToDispatch *[]any,
 ) (appstate.HashState, error) {
+	return cli.applyAppStatePatchesWithPolicy(ctx, name, state, patches, fullSync, eventsToDispatch, eventsToDispatch != nil)
+}
+
+func (cli *Client) applyAppStatePatchesWithPolicy(
+	ctx context.Context,
+	name appstate.WAPatchName,
+	state appstate.HashState,
+	patches *appstate.PatchList,
+	fullSync bool,
+	eventsToDispatch *[]any,
+	emitAllEvents bool,
+) (appstate.HashState, error) {
 	mutations, newState, err := cli.appStateProc.DecodePatches(ctx, patches, state, true)
 	if err != nil {
 		if errors.Is(err, appstate.ErrKeyNotFound) {
@@ -177,7 +189,7 @@ func (cli *Client) applyAppStatePatches(
 		}
 		return state, fmt.Errorf("failed to decode app state %s patches: %w", name, err)
 	}
-	return newState, cli.collectEventsToDispatch(ctx, name, mutations, fullSync, eventsToDispatch)
+	return newState, cli.collectEventsToDispatchWithPolicy(ctx, name, mutations, fullSync, eventsToDispatch, emitAllEvents)
 }
 
 func (cli *Client) collectEventsToDispatch(
@@ -187,45 +199,119 @@ func (cli *Client) collectEventsToDispatch(
 	fullSync bool,
 	eventsToDispatch *[]any,
 ) error {
+	return cli.collectEventsToDispatchWithPolicy(ctx, name, mutations, fullSync, eventsToDispatch, eventsToDispatch != nil)
+}
+
+func (cli *Client) collectEventsToDispatchWithPolicy(
+	ctx context.Context,
+	name appstate.WAPatchName,
+	mutations []appstate.Mutation,
+	fullSync bool,
+	eventsToDispatch *[]any,
+	emitAllEvents bool,
+) error {
 	if name == appstate.WAPatchCriticalUnblockLow && fullSync && !cli.EmitAppStateEventsOnFullSync {
 		var contacts []store.ContactEntry
-		mutations, contacts = cli.filterContacts(mutations)
+		var lidMappings []store.LIDMapping
+		mutations, contacts, lidMappings = cli.filterContacts(mutations)
 		cli.Log.Debugf("Mass inserting app state snapshot with %d contacts into the store", len(contacts))
 		err := cli.Store.Contacts.PutAllContactNames(ctx, contacts)
 		if err != nil {
 			// This is a fairly serious failure, so just abort the whole thing
 			return fmt.Errorf("failed to update contact store with data from snapshot: %v", err)
 		}
+		if len(lidMappings) > 0 && cli.Store.LIDs != nil {
+			err = cli.Store.LIDs.PutManyLIDMappings(ctx, lidMappings)
+			if err != nil {
+				return fmt.Errorf("failed to update LID mapping store with data from snapshot: %v", err)
+			}
+		}
 	}
 	for _, mutation := range mutations {
-		if eventsToDispatch != nil && mutation.Operation == waServerSync.SyncdMutation_SET {
+		if eventsToDispatch != nil && emitAllEvents && mutation.Operation == waServerSync.SyncdMutation_SET {
 			*eventsToDispatch = append(*eventsToDispatch, &events.AppState{Index: mutation.Index, SyncActionValue: mutation.Action})
 		}
 		evt := cli.dispatchAppState(ctx, name, mutation, fullSync)
-		if eventsToDispatch != nil && evt != nil {
+		_, isPushNameSetting := evt.(*events.PushNameSetting)
+		emitPushNameSetting := fullSync && name == appstate.WAPatchCriticalBlock && isPushNameSetting
+		if eventsToDispatch != nil && evt != nil && (emitAllEvents || emitPushNameSetting) {
 			*eventsToDispatch = append(*eventsToDispatch, evt)
 		}
 	}
 	return nil
 }
 
-func (cli *Client) filterContacts(mutations []appstate.Mutation) ([]appstate.Mutation, []store.ContactEntry) {
+func contactActionLIDMapping(indexJID types.JID, act *waSyncAction.ContactAction) (store.LIDMapping, bool) {
+	if act == nil {
+		return store.LIDMapping{}, false
+	}
+	pn := indexJID
+	if rawPN := act.GetPnJID(); rawPN != "" {
+		parsedPN, err := types.ParseJID(rawPN)
+		if err != nil {
+			return store.LIDMapping{}, false
+		}
+		pn = parsedPN
+	}
+	lid, err := types.ParseJID(act.GetLidJID())
+	if err != nil || lid.IsEmpty() || pn.IsEmpty() {
+		return store.LIDMapping{}, false
+	}
+	lid = lid.ToNonAD()
+	pn = pn.ToNonAD()
+	if lid.Server != types.HiddenUserServer || pn.Server != types.DefaultUserServer {
+		return store.LIDMapping{}, false
+	}
+	return store.LIDMapping{LID: lid, PN: pn}, true
+}
+
+func contactActionIsAddContact(act *waSyncAction.ContactAction) bool {
+	// A contact can be saved only in WhatsApp without being saved to the
+	// primary device's address book. The contact action identifies the saved
+	// contact; SaveOnPrimaryAddressbook only controls phone address book sync.
+	return act != nil
+}
+
+func (cli *Client) filterContacts(mutations []appstate.Mutation) ([]appstate.Mutation, []store.ContactEntry, []store.LIDMapping) {
 	filteredMutations := mutations[:0]
 	contacts := make([]store.ContactEntry, 0, len(mutations))
+	lidMappings := make([]store.LIDMapping, 0, len(mutations))
 	for _, mutation := range mutations {
-		if mutation.Index[0] == "contact" && len(mutation.Index) > 1 {
+		if len(mutation.Index) == 0 {
+			filteredMutations = append(filteredMutations, mutation)
+		} else if mutation.Index[0] == appstate.IndexContact && len(mutation.Index) > 1 {
 			jid, _ := types.ParseJID(mutation.Index[1])
 			act := mutation.Action.GetContactAction()
+			if mutation.Operation == waServerSync.SyncdMutation_SET && act == nil {
+				continue
+			}
+			isAddContact := mutation.Operation == waServerSync.SyncdMutation_SET && contactActionIsAddContact(act)
 			contacts = append(contacts, store.ContactEntry{
-				JID:       jid,
-				FirstName: act.GetFirstName(),
-				FullName:  act.GetFullName(),
+				JID:          jid,
+				FirstName:    act.GetFirstName(),
+				FullName:     act.GetFullName(),
+				IsAddContact: isAddContact,
+			})
+			if mapping, ok := contactActionLIDMapping(jid, act); ok {
+				lidMappings = append(lidMappings, mapping)
+			}
+		} else if mutation.Index[0] == appstate.IndexLIDContact && len(mutation.Index) > 1 {
+			jid, _ := types.ParseJID(mutation.Index[1])
+			act := mutation.Action.GetLidContactAction()
+			if mutation.Operation == waServerSync.SyncdMutation_SET && act == nil {
+				continue
+			}
+			contacts = append(contacts, store.ContactEntry{
+				JID:          jid,
+				FirstName:    act.GetFirstName(),
+				FullName:     act.GetFullName(),
+				IsAddContact: mutation.Operation == waServerSync.SyncdMutation_SET,
 			})
 		} else {
 			filteredMutations = append(filteredMutations, mutation)
 		}
 	}
-	return filteredMutations, contacts
+	return filteredMutations, contacts, lidMappings
 }
 
 func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchName, mutation appstate.Mutation, fullSync bool) (eventToDispatch any) {
@@ -260,8 +346,13 @@ func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchNa
 		return
 	}
 
+	if len(mutation.Index) == 0 {
+		return
+	}
+
 	isContactRemove := mutation.Operation == waServerSync.SyncdMutation_REMOVE && mutation.Index[0] == appstate.IndexContact
-	if mutation.Operation != waServerSync.SyncdMutation_SET && !isContactRemove {
+	if mutation.Operation != waServerSync.SyncdMutation_SET &&
+		mutation.Index[0] != appstate.IndexContact && mutation.Index[0] != appstate.IndexLIDContact && !isContactRemove {
 		return
 	}
 
@@ -301,12 +392,39 @@ func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchNa
 		}
 	case appstate.IndexContact:
 		act := mutation.Action.GetContactAction()
+		if mutation.Operation == waServerSync.SyncdMutation_SET && act == nil {
+			return
+		}
 		if isContactRemove {
 			act = nil
 		}
 		eventToDispatch = &events.Contact{JID: jid, Timestamp: ts, Action: act, FromFullSync: fullSync}
 		if cli.Store.Contacts != nil {
-			storeUpdateError = cli.Store.Contacts.PutContactName(ctx, jid, act.GetFirstName(), act.GetFullName())
+			isAddContact := mutation.Operation == waServerSync.SyncdMutation_SET && contactActionIsAddContact(act)
+			storeUpdateError = cli.Store.Contacts.PutContactName(ctx, jid, act.GetFirstName(), act.GetFullName(), isAddContact)
+		}
+		if cli.Store.LIDs != nil {
+			if mapping, ok := contactActionLIDMapping(jid, act); ok {
+				err := cli.Store.LIDs.PutLIDMapping(ctx, mapping.LID, mapping.PN)
+				if err != nil {
+					cli.Log.Warnf("Failed to store LID mapping from contact app state mutation: %v", err)
+				}
+			}
+		}
+	case appstate.IndexLIDContact:
+		act := mutation.Action.GetLidContactAction()
+		if mutation.Operation == waServerSync.SyncdMutation_SET && act == nil {
+			return
+		}
+		contactAction := &waSyncAction.ContactAction{
+			FullName:  proto.String(act.GetFullName()),
+			FirstName: proto.String(act.GetFirstName()),
+			LidJID:    proto.String(jid.String()),
+			Username:  proto.String(act.GetUsername()),
+		}
+		eventToDispatch = &events.Contact{JID: jid, Timestamp: ts, Action: contactAction, FromFullSync: fullSync}
+		if cli.Store.Contacts != nil {
+			storeUpdateError = cli.Store.Contacts.PutContactName(ctx, jid, act.GetFirstName(), act.GetFullName(), mutation.Operation == waServerSync.SyncdMutation_SET)
 		}
 	case appstate.IndexClearChat:
 		act := mutation.Action.GetClearChatAction()
@@ -399,12 +517,45 @@ func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchNa
 			FromFullSync: fullSync,
 		}
 	case appstate.IndexLabelEdit:
+		if len(mutation.Index) < 2 {
+			return
+		}
 		act := mutation.Action.GetLabelEditAction()
 		eventToDispatch = &events.LabelEdit{
 			Timestamp:    ts,
 			LabelID:      mutation.Index[1],
 			Action:       act,
 			FromFullSync: fullSync,
+		}
+		if cli.Store.Labels != nil {
+			isActive := true
+			if act != nil && act.IsActive != nil {
+				isActive = act.GetIsActive()
+			}
+			var rawAction string
+			if act != nil {
+				rawActionBytes, err := protojson.Marshal(act)
+				if err != nil {
+					cli.Log.Warnf("Failed to marshal label edit action for store: %v", err)
+				} else {
+					rawAction = string(rawActionBytes)
+				}
+			}
+			storeUpdateError = cli.Store.Labels.PutLabel(ctx, store.LabelInfo{
+				LabelID:       mutation.Index[1],
+				Name:          act.GetName(),
+				Type:          int32(act.GetType()),
+				Color:         act.GetColor(),
+				PredefinedID:  act.GetPredefinedID(),
+				Deleted:       act.GetDeleted(),
+				IsActive:      isActive,
+				OrderIndex:    act.GetOrderIndex(),
+				IsImmutable:   act.GetIsImmutable(),
+				MuteEndTimeMS: act.GetMuteEndTimeMS(),
+				LastEventTime: ts,
+				FromFullSync:  fullSync,
+				RawAction:     rawAction,
+			})
 		}
 	case appstate.IndexLabelAssociationChat:
 		if len(mutation.Index) < 3 {
@@ -419,6 +570,27 @@ func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchNa
 			Action:       act,
 			FromFullSync: fullSync,
 		}
+		if cli.Store.Labels != nil {
+			var rawAction string
+			if act != nil {
+				rawActionBytes, err := protojson.Marshal(act)
+				if err != nil {
+					cli.Log.Warnf("Failed to marshal label association action for store: %v", err)
+				} else {
+					rawAction = string(rawActionBytes)
+				}
+			}
+			storeUpdateError = cli.Store.Labels.PutLabelMember(ctx, store.LabelMemberInfo{
+				LabelID:       mutation.Index[1],
+				ChatJID:       jid,
+				ChatType:      store.LabelChatTypeForJID(jid),
+				Labeled:       act.GetLabeled(),
+				Source:        store.LabelSourceAssociation,
+				LastEventTime: ts,
+				FromFullSync:  fullSync,
+				RawAction:     rawAction,
+			})
+		}
 	case appstate.IndexLabelAssociationMessage:
 		if len(mutation.Index) < 6 {
 			return
@@ -432,6 +604,21 @@ func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchNa
 			MessageID:    mutation.Index[3],
 			Action:       act,
 			FromFullSync: fullSync,
+		}
+	case appstate.IndexFavorites:
+		act := mutation.Action.GetFavoritesAction()
+		if cli.Store.Labels != nil {
+			favorites := act.GetFavorites()
+			members := make([]types.JID, 0, len(favorites))
+			for _, favorite := range favorites {
+				jid, err := types.ParseJID(favorite.GetID())
+				if err != nil {
+					cli.Log.Warnf("Failed to parse favorites JID %q for label store: %v", favorite.GetID(), err)
+					continue
+				}
+				members = append(members, jid)
+			}
+			storeUpdateError = cli.Store.Labels.ReplaceFavoriteMembers(ctx, members, ts, fullSync)
 		}
 	case appstate.IndexWasaRootSecretAction:
 		if len(mutation.Index) < 2 {
@@ -555,7 +742,22 @@ func (cli *Client) requestAppStateKeys(ctx context.Context, rawKeyIDs [][]byte) 
 //
 //	cli.SendAppState(ctx, appstate.BuildMute(targetJID, true, 24 * time.Hour))
 func (cli *Client) SendAppState(ctx context.Context, patch appstate.PatchInfo) error {
+	if cli == nil {
+		return ErrClientIsNil
+	}
+	cli.appStateSyncLock.Lock()
+	defer cli.appStateSyncLock.Unlock()
 	return cli.sendAppState(ctx, patch, true)
+}
+
+// SetChatNote updates the current user's note for the given chat.
+func (cli *Client) SetChatNote(ctx context.Context, target types.JID, note string) error {
+	if cli == nil {
+		return ErrClientIsNil
+	}
+	cli.appStateSyncLock.Lock()
+	defer cli.appStateSyncLock.Unlock()
+	return cli.sendChatNoteAppState(ctx, appstate.BuildNoteEdit(target, note), true)
 }
 
 func (cli *Client) sendAppState(ctx context.Context, patch appstate.PatchInfo, allowRetry bool) error {
@@ -637,7 +839,100 @@ func (cli *Client) sendAppState(ctx context.Context, patch appstate.PatchInfo, a
 		}
 		return mainErr
 	}
-	eventsToDispatch, err := cli.fetchAppState(ctx, patch.Type, false, false)
+	eventsToDispatch, err := cli.fetchAppStateLocked(ctx, patch.Type, false, false)
+	if err != nil {
+		return fmt.Errorf("failed to fetch app state after sending update: %w", err)
+	}
+	go func() {
+		for _, evt := range eventsToDispatch {
+			cli.dispatchEvent(evt)
+		}
+	}()
+
+	return nil
+}
+
+func (cli *Client) sendChatNoteAppState(ctx context.Context, patch appstate.PatchInfo, allowRetry bool) error {
+	if cli == nil {
+		return ErrClientIsNil
+	}
+	version, hash, err := cli.Store.AppState.GetAppStateVersion(ctx, string(patch.Type))
+	if err != nil {
+		return err
+	}
+	// TODO create new key instead of reusing the primary client's keys
+	latestKeyID, err := cli.Store.AppStateKeys.GetLatestAppStateSyncKeyID(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get latest app state key ID: %w", err)
+	} else if latestKeyID == nil {
+		return fmt.Errorf("no app state keys found, creating app state keys is not yet supported")
+	}
+
+	state := appstate.HashState{Version: version, Hash: hash}
+
+	encodedPatch, err := cli.appStateProc.EncodePatch(ctx, latestKeyID, state, patch)
+	if err != nil {
+		return err
+	}
+
+	resp, err := cli.sendIQ(ctx, infoQuery{
+		Namespace: "w:sync:app:state",
+		Type:      iqSet,
+		To:        types.ServerJID,
+		Content: []waBinary.Node{{
+			Tag:   "sync",
+			Attrs: waBinary.Attrs{"data_namespace": "3"},
+			Content: []waBinary.Node{{
+				Tag: "collection",
+				Attrs: waBinary.Attrs{
+					"name":    string(patch.Type),
+					"order":   "1",
+					"version": version,
+				},
+				Content: []waBinary.Node{{
+					Tag:     "patch",
+					Content: encodedPatch,
+				}},
+			}},
+		}},
+	})
+	if err != nil {
+		return err
+	}
+
+	respCollection, ok := resp.GetOptionalChildByTag("sync", "collection")
+	if !ok {
+		return &ElementMissingError{Tag: "collection", In: "app state send response"}
+	}
+	respCollectionAttr := respCollection.AttrGetter()
+	if respCollectionAttr.OptionalString("type") == "error" {
+		errorTag, ok := respCollection.GetOptionalChildByTag("error")
+
+		mainErr := fmt.Errorf("%w: %s", ErrAppStateUpdate, &respCollection)
+		if ok {
+			mainErr = fmt.Errorf("%w (%s): %s", ErrAppStateUpdate, patch.Type, &errorTag)
+		}
+		if ok && errorTag.AttrGetter().Int("code") == 409 && allowRetry {
+			zerolog.Ctx(ctx).Warn().Err(mainErr).Msg("Failed to update app state, trying to apply conflicts and retry")
+			var eventsToDispatch []any
+			patches, err := appstate.ParsePatchList(ctx, &respCollection, cli.downloadExternalAppStateBlob)
+			if err != nil {
+				return fmt.Errorf("%w (also, parsing patches in the response failed: %w)", mainErr, err)
+			} else if state, err = cli.applyAppStatePatches(ctx, patch.Type, state, patches, false, &eventsToDispatch); err != nil {
+				return fmt.Errorf("%w (also, applying patches in the response failed: %w)", mainErr, err)
+			} else {
+				zerolog.Ctx(ctx).Debug().Msg("Retrying app state send after applying conflicting patches")
+				go func() {
+					for _, evt := range eventsToDispatch {
+						cli.dispatchEvent(evt)
+					}
+				}()
+				return cli.sendChatNoteAppState(ctx, patch, false)
+			}
+		}
+		return mainErr
+	}
+	eventsToDispatch, err := cli.fetchAppStateLocked(ctx, patch.Type, false, false)
 	if err != nil {
 		return fmt.Errorf("failed to fetch app state after sending update: %w", err)
 	}

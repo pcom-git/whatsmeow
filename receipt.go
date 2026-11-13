@@ -40,7 +40,7 @@ func (cli *Client) handleReceipt(ctx context.Context, node *waBinary.Node) {
 		} else {
 			defer cli.maybeDeferredAck(ctx, node)(&cancelled)
 		}
-		cancelled = cli.dispatchEvent(receipt)
+		cancelled = cli.dispatchReceiptEvent(receipt)
 	}
 }
 
@@ -64,7 +64,7 @@ func (cli *Client) handleGroupedReceipt(partialReceipt events.Receipt, participa
 			cli.Log.Warnf("Failed to parse user node %s in grouped receipt: %v", &child, ag.Error())
 			continue
 		}
-		cancelled = cli.dispatchEvent(&receipt) || cancelled
+		cli.dispatchReceiptEvent(&receipt)
 	}
 	return
 }

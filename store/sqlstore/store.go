@@ -8,6 +8,7 @@
 package sqlstore
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"database/sql/driver"
@@ -68,6 +69,7 @@ func NewSQLStore(c *Container, jid types.JID) *SQLStore {
 }
 
 var _ store.AllSessionSpecificStores = (*SQLStore)(nil)
+var _ store.PreKeySyncStore = (*SQLStore)(nil)
 
 const (
 	putIdentityQuery = `
@@ -305,66 +307,203 @@ func (s *SQLStore) MigratePNToLID(ctx context.Context, pn, lid types.JID) error 
 }
 
 const (
-	getLastPreKeyIDQuery        = `SELECT MAX(key_id) FROM whatsmeow_pre_keys WHERE jid=$1`
-	insertPreKeyQuery           = `INSERT INTO whatsmeow_pre_keys (jid, key_id, key, uploaded) VALUES ($1, $2, $3, $4)`
-	getUnuploadedPreKeysQuery   = `SELECT key_id, key FROM whatsmeow_pre_keys WHERE jid=$1 AND uploaded=false ORDER BY key_id LIMIT $2`
-	getPreKeyQuery              = `SELECT key_id, key FROM whatsmeow_pre_keys WHERE jid=$1 AND key_id=$2`
-	deletePreKeyQuery           = `DELETE FROM whatsmeow_pre_keys WHERE jid=$1 AND key_id=$2`
-	markPreKeysAsUploadedQuery  = `UPDATE whatsmeow_pre_keys SET uploaded=true WHERE jid=$1 AND key_id<=$2`
-	getUploadedPreKeyCountQuery = `SELECT COUNT(*) FROM whatsmeow_pre_keys WHERE jid=$1 AND uploaded=true`
+	preKeyServerIDMin uint32 = store.PreKeyServerIDMin
+	preKeyServerIDMax uint32 = store.PreKeyServerIDMax
+	preKeyRetryIDMin  uint32 = store.PreKeyRetryIDMin
+	preKeyRetryIDMax  uint32 = store.PreKeyRetryIDMax
+
+	maxRetryPreKeyCount     = 5_000
+	retryPreKeyCleanupBatch = 1_000
+	// The count is a cleanup threshold, not a hard limit: retained private keys
+	// may still be needed by messages encrypted with a previously sent receipt.
+	retryPreKeyMinRetention = 7 * 24 * time.Hour
+
+	getLastPreKeyIDQuery          = `SELECT MAX(key_id) FROM whatsmeow_pre_keys WHERE jid=$1 AND key_id BETWEEN $2 AND $3`
+	getPreKeyIDsInRangeQuery      = `SELECT key_id FROM whatsmeow_pre_keys WHERE jid=$1 AND key_id BETWEEN $2 AND $3 ORDER BY key_id`
+	insertPreKeyQuery             = `INSERT INTO whatsmeow_pre_keys (jid, key_id, key, uploaded, created_at) VALUES ($1, $2, $3, $4, $5)`
+	getUnuploadedPreKeysQuery     = `SELECT key_id, key FROM whatsmeow_pre_keys WHERE jid=$1 AND uploaded=false AND key_id BETWEEN $2 AND $3 ORDER BY key_id LIMIT $4`
+	getPreKeyQuery                = `SELECT key_id, key FROM whatsmeow_pre_keys WHERE jid=$1 AND key_id=$2`
+	deletePreKeyQuery             = `DELETE FROM whatsmeow_pre_keys WHERE jid=$1 AND key_id=$2`
+	getRetryPreKeyCountQuery      = `SELECT COUNT(*) FROM whatsmeow_pre_keys WHERE jid=$1 AND key_id BETWEEN $2 AND $3`
+	initializeRetryPreKeyAgeQuery = `UPDATE whatsmeow_pre_keys SET created_at=$4 WHERE jid=$1 AND key_id BETWEEN $2 AND $3 AND created_at=0`
+	deleteOldestRetryPreKeysQuery = `
+		DELETE FROM whatsmeow_pre_keys
+		WHERE jid=$1 AND key_id IN (
+			SELECT key_id FROM whatsmeow_pre_keys
+			WHERE jid=$1 AND key_id BETWEEN $2 AND $3 AND created_at > 0 AND created_at < $4
+			ORDER BY created_at, key_id
+			LIMIT $5
+		)
+	`
+	markPreKeysAsUploadedQuery  = `UPDATE whatsmeow_pre_keys SET uploaded=true WHERE jid=$1 AND key_id BETWEEN $2 AND $3 AND key_id<=$4`
+	getUploadedPreKeyCountQuery = `SELECT COUNT(*) FROM whatsmeow_pre_keys WHERE jid=$1 AND uploaded=true AND key_id BETWEEN $2 AND $3`
+	getUploadedPreKeyIDsQuery   = `SELECT key_id FROM whatsmeow_pre_keys WHERE jid=$1 AND uploaded=true AND key_id BETWEEN $2 AND $3 ORDER BY key_id`
+	markPreKeyAsUploadedQuery   = `UPDATE whatsmeow_pre_keys SET uploaded=true WHERE jid=$1 AND key_id=$2`
+	deleteAllPreKeysQuery       = `DELETE FROM whatsmeow_pre_keys WHERE jid=$1`
 )
 
 func (s *SQLStore) genOnePreKey(ctx context.Context, id uint32, markUploaded bool) (*keys.PreKey, error) {
 	key := keys.NewPreKey(id)
-	_, err := s.db.Exec(ctx, insertPreKeyQuery, s.JID, key.KeyID, key.Priv[:], markUploaded)
+	_, err := s.db.Exec(ctx, insertPreKeyQuery, s.JID, key.KeyID, key.Priv[:], markUploaded, time.Now().Unix())
 	return key, err
 }
 
-func (s *SQLStore) getNextPreKeyID(ctx context.Context) (uint32, error) {
-	var lastKeyID sql.NullInt32
-	err := s.db.QueryRow(ctx, getLastPreKeyIDQuery, s.JID).Scan(&lastKeyID)
+func (s *SQLStore) getNextPreKeyID(ctx context.Context, minID, maxID uint32) (uint32, error) {
+	ids, err := s.getAvailablePreKeyIDs(ctx, minID, maxID, 1)
 	if err != nil {
-		return 0, fmt.Errorf("failed to query next prekey ID: %w", err)
+		return 0, err
 	}
-	return uint32(lastKeyID.Int32) + 1, nil
+	return ids[0], nil
+}
+
+// getAvailablePreKeyIDs first allocates above the highest stored ID, then wraps
+// through gaps if needed. It scans stored rows rather than probing every ID in
+// the range, and never reuses an ID whose private key is still retained.
+// The caller must hold preKeyLock until the selected keys have been inserted.
+func (s *SQLStore) getAvailablePreKeyIDs(ctx context.Context, minID, maxID, count uint32) ([]uint32, error) {
+	if minID == 0 || minID > maxID || uint64(count) > uint64(maxID)-uint64(minID)+1 {
+		return nil, fmt.Errorf("invalid prekey allocation range %d..%d for %d keys", minID, maxID, count)
+	} else if count == 0 {
+		return nil, nil
+	}
+	var lastKeyID sql.NullInt64
+	err := s.db.QueryRow(ctx, getLastPreKeyIDQuery, s.JID, minID, maxID).Scan(&lastKeyID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query next prekey ID: %w", err)
+	}
+	nextID := uint64(minID)
+	if lastKeyID.Valid {
+		if lastKeyID.Int64 < int64(minID) || lastKeyID.Int64 > int64(maxID) {
+			return nil, fmt.Errorf("database returned prekey ID %d outside range %d..%d", lastKeyID.Int64, minID, maxID)
+		}
+		nextID = uint64(lastKeyID.Int64) + 1
+	}
+	ids := make([]uint32, 0, count)
+	for nextID <= uint64(maxID) && uint32(len(ids)) < count {
+		ids = append(ids, uint32(nextID))
+		nextID++
+	}
+	if uint32(len(ids)) == count {
+		return ids, nil
+	}
+	rows, err := s.db.Query(ctx, getPreKeyIDsInRangeQuery, s.JID, minID, maxID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query prekey ID gaps: %w", err)
+	}
+	defer rows.Close()
+	nextID = uint64(minID)
+	for rows.Next() {
+		var usedID uint32
+		if err = rows.Scan(&usedID); err != nil {
+			return nil, fmt.Errorf("failed to scan prekey ID: %w", err)
+		}
+		for nextID < uint64(usedID) && uint32(len(ids)) < count {
+			ids = append(ids, uint32(nextID))
+			nextID++
+		}
+		if uint32(len(ids)) == count {
+			return ids, nil
+		}
+		nextID = uint64(usedID) + 1
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to read prekey ID gaps: %w", err)
+	}
+	return nil, fmt.Errorf("prekey ID range %d..%d has fewer than %d available IDs", minID, maxID, count)
 }
 
 func (s *SQLStore) GenOnePreKey(ctx context.Context) (*keys.PreKey, error) {
 	s.preKeyLock.Lock()
 	defer s.preKeyLock.Unlock()
-	nextKeyID, err := s.getNextPreKeyID(ctx)
+	nextKeyID, err := s.getNextPreKeyID(ctx, preKeyServerIDMin, preKeyServerIDMax)
 	if err != nil {
 		return nil, err
 	}
 	return s.genOnePreKey(ctx, nextKeyID, true)
 }
 
+// GenOneRetryPreKey generates a prekey in the private retry-only ID range.
+// It intentionally isn't part of store.PreKeyStore: retry handling discovers
+// this method through an optional private interface and falls back for stores
+// that don't implement it.
+func (s *SQLStore) GenOneRetryPreKey(ctx context.Context) (*keys.PreKey, error) {
+	s.preKeyLock.Lock()
+	defer s.preKeyLock.Unlock()
+
+	now := time.Now().Unix()
+	// Upgraded databases do not know when old keys were created. Give those
+	// keys a full retention interval from first use instead of deleting them
+	// immediately as if their creation time were the Unix epoch.
+	_, err := s.db.Exec(ctx, initializeRetryPreKeyAgeQuery, s.JID, preKeyRetryIDMin, preKeyRetryIDMax, now)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize retry prekey ages: %w", err)
+	}
+	var retryPreKeyCount int
+	err = s.db.QueryRow(ctx, getRetryPreKeyCountQuery, s.JID, preKeyRetryIDMin, preKeyRetryIDMax).Scan(&retryPreKeyCount)
+	if err != nil {
+		return nil, fmt.Errorf("failed to count retry prekeys: %w", err)
+	}
+	if retryPreKeyCount > maxRetryPreKeyCount {
+		_, err = s.db.Exec(
+			ctx,
+			deleteOldestRetryPreKeysQuery,
+			s.JID,
+			preKeyRetryIDMin,
+			preKeyRetryIDMax,
+			now-int64(retryPreKeyMinRetention/time.Second),
+			retryPreKeyCleanupBatch,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to clean up retry prekeys: %w", err)
+		}
+	}
+
+	nextKeyID, err := s.getNextPreKeyID(ctx, preKeyRetryIDMin, preKeyRetryIDMax)
+	if err != nil {
+		return nil, err
+	}
+	return s.genOnePreKey(ctx, nextKeyID, false)
+}
+
 func (s *SQLStore) GetOrGenPreKeys(ctx context.Context, count uint32) ([]*keys.PreKey, error) {
 	s.preKeyLock.Lock()
 	defer s.preKeyLock.Unlock()
 
-	newKeys, err := scanPreKey.NewRowIter(s.db.Query(ctx, getUnuploadedPreKeysQuery, s.JID, count)).AsList()
+	newKeys, err := scanPreKey.NewRowIter(s.db.Query(
+		ctx,
+		getUnuploadedPreKeysQuery,
+		s.JID,
+		preKeyServerIDMin,
+		preKeyServerIDMax,
+		count,
+	)).AsList()
 	if err != nil {
 		return nil, fmt.Errorf("failed to query existing prekeys: %w", err)
 	}
 
 	alreadyGeneratedCount := uint32(len(newKeys))
 	if count > alreadyGeneratedCount {
-		var nextKeyID uint32
-		nextKeyID, err = s.getNextPreKeyID(ctx)
+		var availableIDs []uint32
+		availableIDs, err = s.getAvailablePreKeyIDs(ctx, preKeyServerIDMin, preKeyServerIDMax, count-alreadyGeneratedCount)
 		if err != nil {
 			return nil, err
 		}
 		newKeys = slices.Grow(newKeys, int(count)-len(newKeys))[:count]
-		for i := alreadyGeneratedCount; i < count; i++ {
-			newKeys[i], err = s.genOnePreKey(ctx, nextKeyID, false)
-			if err != nil {
-				return nil, fmt.Errorf("failed to generate prekey: %w", err)
+		err = s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
+			for i, id := range availableIDs {
+				newKeys[int(alreadyGeneratedCount)+i], err = s.genOnePreKey(ctx, id, false)
+				if err != nil {
+					return fmt.Errorf("failed to generate prekey: %w", err)
+				}
 			}
-			nextKeyID++
+			return nil
+		})
+		if err != nil {
+			return nil, err
 		}
 	}
 
+	slices.SortFunc(newKeys, func(a, b *keys.PreKey) int { return cmp.Compare(a.KeyID, b.KeyID) })
 	return newKeys, nil
 }
 
@@ -395,13 +534,133 @@ func (s *SQLStore) RemovePreKey(ctx context.Context, id uint32) error {
 }
 
 func (s *SQLStore) MarkPreKeysAsUploaded(ctx context.Context, upToID uint32) error {
-	_, err := s.db.Exec(ctx, markPreKeysAsUploadedQuery, s.JID, upToID)
+	s.preKeyLock.Lock()
+	defer s.preKeyLock.Unlock()
+	_, err := s.db.Exec(ctx, markPreKeysAsUploadedQuery, s.JID, preKeyServerIDMin, preKeyServerIDMax, upToID)
 	return err
 }
 
 func (s *SQLStore) UploadedPreKeyCount(ctx context.Context) (count int, err error) {
-	err = s.db.QueryRow(ctx, getUploadedPreKeyCountQuery, s.JID).Scan(&count)
+	err = s.db.QueryRow(ctx, getUploadedPreKeyCountQuery, s.JID, preKeyServerIDMin, preKeyServerIDMax).Scan(&count)
 	return
+}
+
+func validateServerPreKeyIDs(ids []uint32) ([]uint32, error) {
+	ids = slices.Clone(ids)
+	slices.Sort(ids)
+	for i, id := range ids {
+		if id < preKeyServerIDMin || id > preKeyServerIDMax {
+			return nil, fmt.Errorf("prekey ID %d outside server range %d..%d", id, preKeyServerIDMin, preKeyServerIDMax)
+		} else if i > 0 && ids[i-1] == id {
+			return nil, fmt.Errorf("duplicate prekey ID %d", id)
+		}
+	}
+	return ids, nil
+}
+
+func (s *SQLStore) UploadedPreKeyIDs(ctx context.Context) ([]uint32, error) {
+	rows, err := s.db.Query(ctx, getUploadedPreKeyIDsQuery, s.JID, preKeyServerIDMin, preKeyServerIDMax)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []uint32
+	for rows.Next() {
+		var id uint32
+		if err = rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+func (s *SQLStore) PreKeyIDs(ctx context.Context) ([]uint32, error) {
+	rows, err := s.db.Query(ctx, getPreKeyIDsInRangeQuery, s.JID, preKeyServerIDMin, preKeyServerIDMax)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []uint32
+	for rows.Next() {
+		var id uint32
+		if err = rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+func (s *SQLStore) MarkPreKeysAsUploadedIDs(ctx context.Context, ids []uint32) error {
+	ids, err := validateServerPreKeyIDs(ids)
+	if err != nil || len(ids) == 0 {
+		return err
+	}
+	s.preKeyLock.Lock()
+	defer s.preKeyLock.Unlock()
+	return s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
+		for _, id := range ids {
+			if _, err := s.db.Exec(ctx, markPreKeyAsUploadedQuery, s.JID, id); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// SyncUploadedPreKeyIDs prunes ordinary prekeys to the confirmed server
+// inventory. Missing server IDs are never assigned another private key.
+func (s *SQLStore) SyncUploadedPreKeyIDs(ctx context.Context, ids []uint32) error {
+	ids, err := validateServerPreKeyIDs(ids)
+	if err != nil {
+		return err
+	}
+	keep := make(map[uint32]bool, len(ids))
+	for _, id := range ids {
+		keep[id] = true
+	}
+	s.preKeyLock.Lock()
+	defer s.preKeyLock.Unlock()
+	return s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
+		rows, err := s.db.Query(ctx, getPreKeyIDsInRangeQuery, s.JID, preKeyServerIDMin, preKeyServerIDMax)
+		if err != nil {
+			return err
+		}
+		var existing []uint32
+		for rows.Next() {
+			var id uint32
+			if err = rows.Scan(&id); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			existing = append(existing, id)
+		}
+		err = rows.Err()
+		closeErr := rows.Close()
+		if err != nil {
+			return err
+		} else if closeErr != nil {
+			return closeErr
+		}
+		for _, id := range existing {
+			query := deletePreKeyQuery
+			if keep[id] {
+				query = markPreKeyAsUploadedQuery
+			}
+			if _, err = s.db.Exec(ctx, query, s.JID, id); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func (s *SQLStore) ClearPreKeys(ctx context.Context) error {
+	s.preKeyLock.Lock()
+	defer s.preKeyLock.Unlock()
+	_, err := s.db.Exec(ctx, deleteAllPreKeysQuery, s.JID)
+	return err
 }
 
 const (
@@ -582,8 +841,8 @@ func (s *SQLStore) GetAppStateMutationMAC(ctx context.Context, name string, inde
 
 const (
 	putContactNameQuery = `
-		INSERT INTO whatsmeow_contacts (our_jid, their_jid, first_name, full_name) VALUES ($1, $2, $3, $4)
-		ON CONFLICT (our_jid, their_jid) DO UPDATE SET first_name=excluded.first_name, full_name=excluded.full_name
+		INSERT INTO whatsmeow_contacts (our_jid, their_jid, first_name, full_name, is_add_contact) VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (our_jid, their_jid) DO UPDATE SET first_name=excluded.first_name, full_name=excluded.full_name, is_add_contact=excluded.is_add_contact
 	`
 	putRedactedPhoneQuery = `
 		INSERT INTO whatsmeow_contacts (our_jid, their_jid, redacted_phone)
@@ -599,15 +858,73 @@ const (
 		ON CONFLICT (our_jid, their_jid) DO UPDATE SET business_name=excluded.business_name
 	`
 	getContactQuery = `
-		SELECT first_name, full_name, push_name, business_name, redacted_phone FROM whatsmeow_contacts WHERE our_jid=$1 AND their_jid=$2
+		SELECT first_name, full_name, push_name, business_name, redacted_phone, is_add_contact, local_username FROM whatsmeow_contacts WHERE our_jid=$1 AND their_jid=$2
 	`
 	getAllContactsQuery = `
-		SELECT their_jid, first_name, full_name, push_name, business_name, redacted_phone FROM whatsmeow_contacts WHERE our_jid=$1
+		SELECT their_jid, first_name, full_name, push_name, business_name, redacted_phone, is_add_contact, local_username FROM whatsmeow_contacts WHERE our_jid=$1
+	`
+	getContactListPageCountQuery = `
+		SELECT COUNT(*)
+		FROM whatsmeow_contacts
+		WHERE our_jid = $1
+		  AND is_add_contact=true
+	`
+	getContactListPageQuery = `
+		SELECT
+			c.their_jid,
+			c.first_name,
+			c.full_name,
+			c.push_name,
+			c.business_name,
+			c.redacted_phone,
+			c.is_add_contact,
+			COALESCE(NULLIF(c.local_username, ''), lid_contact.local_username, ''),
+			lm.lid
+		FROM whatsmeow_contacts c
+		LEFT JOIN whatsmeow_lid_map lm
+		  ON c.their_jid LIKE '%@s.whatsapp.net'
+		 AND replace(c.their_jid, '@s.whatsapp.net', '') = lm.pn
+		LEFT JOIN whatsmeow_contacts lid_contact
+		  ON lid_contact.our_jid = c.our_jid
+		 AND lid_contact.their_jid = lm.lid || '@lid'
+		WHERE c.our_jid = $1
+		  AND c.is_add_contact=true
+		ORDER BY c.their_jid ASC
+		LIMIT $2 OFFSET $3
+	`
+	searchContactListQuery = `
+		SELECT
+			c.their_jid,
+			c.first_name,
+			c.full_name,
+			c.push_name,
+			c.business_name,
+			c.redacted_phone,
+			c.is_add_contact,
+			COALESCE(NULLIF(c.local_username, ''), lid_contact.local_username, ''),
+			lm.lid
+		FROM whatsmeow_contacts c
+		LEFT JOIN whatsmeow_lid_map lm
+		  ON c.their_jid LIKE '%@s.whatsapp.net'
+		 AND replace(c.their_jid, '@s.whatsapp.net', '') = lm.pn
+		LEFT JOIN whatsmeow_contacts lid_contact
+		  ON lid_contact.our_jid = c.our_jid
+		 AND lid_contact.their_jid = lm.lid || '@lid'
+		WHERE c.our_jid = $1
+		  AND c.is_add_contact=true
+		  AND (
+			c.their_jid LIKE $2
+			OR COALESCE(c.first_name, '') LIKE $2
+			OR COALESCE(c.full_name, '') LIKE $2
+			OR COALESCE(c.push_name, '') LIKE $2
+			OR COALESCE(c.business_name, '') LIKE $2
+		  )
+		ORDER BY c.their_jid ASC
 	`
 )
 
 var putContactNamesMassInsertBuilder = dbutil.NewMassInsertBuilder[store.ContactEntry, [1]any](
-	putContactNameQuery, "($1, $%d, $%d, $%d)",
+	putContactNameQuery, "($1, $%d, $%d, $%d, $%d)",
 )
 
 var putRedactedPhonesMassInsertBuilder = dbutil.NewMassInsertBuilder[store.RedactedPhoneEntry, [1]any](
@@ -656,7 +973,7 @@ func (s *SQLStore) PutBusinessName(ctx context.Context, user types.JID, business
 	return false, "", nil
 }
 
-func (s *SQLStore) PutContactName(ctx context.Context, user types.JID, firstName, fullName string) error {
+func (s *SQLStore) PutContactName(ctx context.Context, user types.JID, firstName, fullName string, isAddContact bool) error {
 	s.contactCacheLock.Lock()
 	defer s.contactCacheLock.Unlock()
 
@@ -664,19 +981,21 @@ func (s *SQLStore) PutContactName(ctx context.Context, user types.JID, firstName
 	if err != nil {
 		return err
 	}
-	if cached.FirstName != firstName || cached.FullName != fullName {
-		_, err = s.db.Exec(ctx, putContactNameQuery, s.JID, user, firstName, fullName)
+	if cached.FirstName != firstName || cached.FullName != fullName || cached.IsAddContact != isAddContact {
+		_, err = s.db.Exec(ctx, putContactNameQuery, s.JID, user, firstName, fullName, isAddContact)
 		if err != nil {
 			return err
 		}
 		cached.FirstName = firstName
 		cached.FullName = fullName
+		cached.IsAddContact = isAddContact
 		cached.Found = true
 	}
 	return nil
 }
 
-const contactBatchSize = 300
+// Each contact uses four parameters plus one shared our_jid: 1 + 4*200 = 801 < 999.
+const contactBatchSize = 200
 
 func (s *SQLStore) PutAllContactNames(ctx context.Context, contacts []store.ContactEntry) error {
 	if len(contacts) == 0 {
@@ -752,8 +1071,9 @@ func (s *SQLStore) getContact(ctx context.Context, user types.JID) (*types.Conta
 		return cached, nil
 	}
 
-	var first, full, push, business, redactedPhone sql.NullString
-	err := s.db.QueryRow(ctx, getContactQuery, s.JID, user).Scan(&first, &full, &push, &business, &redactedPhone)
+	var first, full, push, business, redactedPhone, username sql.NullString
+	var isAddContact bool
+	err := s.db.QueryRow(ctx, getContactQuery, s.JID, user).Scan(&first, &full, &push, &business, &redactedPhone, &isAddContact, &username)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
 	}
@@ -762,21 +1082,75 @@ func (s *SQLStore) getContact(ctx context.Context, user types.JID) (*types.Conta
 		FirstName:     first.String,
 		FullName:      full.String,
 		PushName:      push.String,
+		Username:      username.String,
 		BusinessName:  business.String,
+		IsAddContact:  isAddContact,
 		RedactedPhone: redactedPhone.String,
 	}
 	s.contactCache[user] = info
 	return info, nil
 }
 
+func firstNonEmptyContactField(primary, fallback string) string {
+	if primary != "" {
+		return primary
+	}
+	return fallback
+}
+
+func mergeMappedContactInfo(primary, fallback types.ContactInfo) types.ContactInfo {
+	return types.ContactInfo{
+		Found:         primary.Found || fallback.Found,
+		FirstName:     firstNonEmptyContactField(primary.FirstName, fallback.FirstName),
+		FullName:      firstNonEmptyContactField(primary.FullName, fallback.FullName),
+		PushName:      firstNonEmptyContactField(primary.PushName, fallback.PushName),
+		Username:      firstNonEmptyContactField(primary.Username, fallback.Username),
+		BusinessName:  firstNonEmptyContactField(primary.BusinessName, fallback.BusinessName),
+		RedactedPhone: firstNonEmptyContactField(primary.RedactedPhone, fallback.RedactedPhone),
+		IsAddContact:  primary.IsAddContact || fallback.IsAddContact,
+	}
+}
+
 func (s *SQLStore) GetContact(ctx context.Context, user types.JID) (types.ContactInfo, error) {
 	s.contactCacheLock.Lock()
 	info, err := s.getContact(ctx, user)
-	s.contactCacheLock.Unlock()
 	if err != nil {
+		s.contactCacheLock.Unlock()
 		return types.ContactInfo{}, err
 	}
-	return *info, nil
+	contact := *info
+	if user.Server == types.HiddenUserServer && s.LIDMap != nil {
+		pn, err := s.LIDMap.GetPNForLID(ctx, user)
+		if err != nil {
+			s.contactCacheLock.Unlock()
+			return types.ContactInfo{}, err
+		}
+		if !pn.IsEmpty() {
+			phoneInfo, err := s.getContact(ctx, pn)
+			if err != nil {
+				s.contactCacheLock.Unlock()
+				return types.ContactInfo{}, err
+			}
+			contact = mergeMappedContactInfo(*phoneInfo, contact)
+		}
+	} else if user.Server == types.DefaultUserServer && contact.Username == "" && s.LIDMap != nil {
+		lid, err := s.LIDMap.GetLIDForPN(ctx, user)
+		if err != nil {
+			s.contactCacheLock.Unlock()
+			return types.ContactInfo{}, err
+		}
+		if !lid.IsEmpty() {
+			lidInfo, err := s.getContact(ctx, lid)
+			if err != nil {
+				s.contactCacheLock.Unlock()
+				return types.ContactInfo{}, err
+			}
+			contact.Username = lidInfo.Username
+			contact.Found = contact.Found || contact.Username != ""
+		}
+	}
+	s.contactCacheLock.Unlock()
+	return contact, nil
 }
 
 type contactTuple struct {
@@ -786,8 +1160,9 @@ type contactTuple struct {
 
 var convertContactRow = dbutil.ConvertRowFn[*contactTuple](func(rows dbutil.Scannable) (*contactTuple, error) {
 	var jid types.JID
-	var first, full, push, business, redactedPhone sql.NullString
-	err := rows.Scan(&jid, &first, &full, &push, &business, &redactedPhone)
+	var first, full, push, business, redactedPhone, username sql.NullString
+	var isAddContact bool
+	err := rows.Scan(&jid, &first, &full, &push, &business, &redactedPhone, &isAddContact, &username)
 	if err != nil {
 		return nil, fmt.Errorf("error scanning row: %w", err)
 	}
@@ -798,7 +1173,9 @@ var convertContactRow = dbutil.ConvertRowFn[*contactTuple](func(rows dbutil.Scan
 			FirstName:     first.String,
 			FullName:      full.String,
 			PushName:      push.String,
+			Username:      username.String,
 			BusinessName:  business.String,
+			IsAddContact:  isAddContact,
 			RedactedPhone: redactedPhone.String,
 		},
 	}, nil
@@ -814,6 +1191,102 @@ func (s *SQLStore) GetAllContacts(ctx context.Context) (map[types.JID]types.Cont
 		return true, nil
 	})
 	return output, err
+}
+
+func normalizeContactListPageOptions(options store.ContactListPageOptions) store.ContactListPageOptions {
+	options.Keyword = strings.TrimSpace(options.Keyword)
+	if options.Keyword != "" {
+		options.Page = 1
+		options.PageSize = 0
+		return options
+	}
+	if options.Page <= 0 {
+		options.Page = 1
+	}
+	if options.PageSize <= 0 {
+		options.PageSize = 50
+	} else if options.PageSize > 500 {
+		options.PageSize = 500
+	}
+	return options
+}
+
+func appendContactListPageRows(page store.ContactListPage, rows dbutil.Rows) (store.ContactListPage, error) {
+	defer rows.Close()
+
+	for rows.Next() {
+		var jid types.JID
+		var first, full, push, business, redactedPhone, username, lidUser sql.NullString
+		var isAddContact bool
+		err := rows.Scan(&jid, &first, &full, &push, &business, &redactedPhone, &isAddContact, &username, &lidUser)
+		if err != nil {
+			return page, fmt.Errorf("error scanning row: %w", err)
+		}
+
+		var lid types.JID
+		if jid.Server == types.HiddenUserServer {
+			lid = jid
+		} else if jid.Server == types.DefaultUserServer && lidUser.Valid && lidUser.String != "" {
+			lid = types.JID{User: lidUser.String, Server: types.HiddenUserServer}
+		}
+
+		page.List = append(page.List, store.ContactListPageEntry{
+			JID: jid,
+			LID: lid,
+			Info: types.ContactInfo{
+				Found:         true,
+				FirstName:     first.String,
+				FullName:      full.String,
+				PushName:      push.String,
+				Username:      username.String,
+				BusinessName:  business.String,
+				IsAddContact:  isAddContact,
+				RedactedPhone: redactedPhone.String,
+			},
+		})
+	}
+	return page, rows.Err()
+}
+
+func (s *SQLStore) GetContactListPage(ctx context.Context, options store.ContactListPageOptions) (store.ContactListPage, error) {
+	options = normalizeContactListPageOptions(options)
+	page := store.ContactListPage{
+		List:     []store.ContactListPageEntry{},
+		Page:     options.Page,
+		PageSize: options.PageSize,
+	}
+
+	if options.Keyword != "" {
+		rows, err := s.db.Query(ctx, searchContactListQuery, s.JID, "%"+options.Keyword+"%")
+		if err != nil {
+			return page, err
+		}
+		page, err = appendContactListPageRows(page, rows)
+		if err != nil {
+			return page, err
+		}
+		page.Total = len(page.List)
+		if page.Total > 0 {
+			page.TotalPages = 1
+		}
+		return page, nil
+	}
+
+	err := s.db.QueryRow(ctx, getContactListPageCountQuery, s.JID).Scan(&page.Total)
+	if err != nil {
+		return page, err
+	}
+	if page.Total > 0 {
+		page.TotalPages = (page.Total + options.PageSize - 1) / options.PageSize
+		page.HasMore = options.Page < page.TotalPages
+	}
+
+	offset := (options.Page - 1) * options.PageSize
+	rows, err := s.db.Query(ctx, getContactListPageQuery, s.JID, options.PageSize, offset)
+	if err != nil {
+		return page, err
+	}
+	return appendContactListPageRows(page, rows)
 }
 
 const (
@@ -973,7 +1446,24 @@ const (
 	deleteNCTSaltQuery = `DELETE FROM whatsmeow_nct_salt WHERE our_jid=$1`
 )
 
+// Each token uses four parameters plus one shared our_jid: 1 + 4*200 = 801 < 999.
+const privacyTokenBatchSize = 200
+
 func (s *SQLStore) PutPrivacyTokens(ctx context.Context, tokens ...store.PrivacyToken) error {
+	if len(tokens) == 0 {
+		return nil
+	}
+	return s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
+		for batch := range slices.Chunk(tokens, privacyTokenBatchSize) {
+			if err := s.putPrivacyTokens(ctx, batch); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func (s *SQLStore) putPrivacyTokens(ctx context.Context, tokens []store.PrivacyToken) error {
 	args := make([]any, 1+len(tokens)*4)
 	placeholders := make([]string, len(tokens))
 	args[0] = s.JID

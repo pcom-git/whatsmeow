@@ -39,7 +39,7 @@ func (cli *Client) handleDecryptedArmadillo(ctx context.Context, info *types.Mes
 		}
 	}
 	if dec.Message != nil || dec.FBApplication != nil {
-		handlerFailed = cli.dispatchEvent(&dec)
+		handlerFailed = cli.dispatchMessageEvent(&dec)
 	}
 	return
 }

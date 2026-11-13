@@ -78,6 +78,9 @@ type ContactInfo struct {
 	FullName     string
 	PushName     string
 	BusinessName string
+	IsAddContact bool
+	// Username is persisted by the temporary local username compatibility layer.
+	Username string
 	// Only for LID members encountered in groups, the phone number in the form "+1∙∙∙∙∙∙∙∙80"
 	RedactedPhone string
 }

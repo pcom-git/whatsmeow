@@ -8,6 +8,8 @@ package whatsmeow
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"slices"
@@ -92,19 +94,24 @@ func (cli *Client) handleAppStateNotification(ctx context.Context, node *waBinar
 
 func (cli *Client) handlePictureNotification(ctx context.Context, node *waBinary.Node) {
 	ts := node.AttrGetter().UnixTime("t")
+	var contacts map[types.JID]types.ContactInfo
+	contactsLoaded := false
 	for _, child := range node.GetChildren() {
 		ag := child.AttrGetter()
 		var evt events.Picture
 		evt.Timestamp = ts
-		evt.JID = ag.JID("jid")
 		evt.Author = ag.OptionalJIDOrEmpty("author")
+		jid := ag.OptionalJIDOrEmpty("jid").ToNonAD()
+		hash := ""
+		if jid.IsEmpty() {
+			hash = ag.OptionalString("hash")
+		}
 		if child.Tag == "delete" {
 			evt.Remove = true
 		} else if child.Tag == "add" {
 			evt.PictureID = ag.String("id")
 		} else if child.Tag == "set" {
-			// TODO sometimes there's a hash and no ID?
-			evt.PictureID = ag.String("id")
+			evt.PictureID = ag.OptionalString("id")
 		} else {
 			continue
 		}
@@ -112,8 +119,63 @@ func (cli *Client) handlePictureNotification(ctx context.Context, node *waBinary
 			cli.Log.Debugf("Ignoring picture change notification with unexpected attributes: %v", ag.Error())
 			continue
 		}
-		cli.dispatchEvent(&evt)
+
+		matches := make([]types.JID, 0, 1)
+		if !jid.IsEmpty() {
+			matches = append(matches, jid)
+		} else if hash != "" {
+			if !contactsLoaded {
+				contactsLoaded = true
+				var err error
+				contacts, err = cli.Store.Contacts.GetAllContacts(ctx)
+				if err != nil {
+					cli.Log.Warnf("Failed to load contacts for picture notification hash lookup: %v", err)
+					contacts = nil
+				}
+			}
+			for contactJID := range contacts {
+				contactJID = contactJID.ToNonAD()
+				if contactJID.Server != types.HiddenUserServer {
+					continue
+				}
+				sum := md5.Sum([]byte(contactJID.User + "WA_ADD_NOTIF"))
+				// The notification contains a truncated Base64 prefix of the MD5 digest.
+				encodedHash := base64.StdEncoding.EncodeToString(sum[:])
+				if len(hash) <= len(encodedHash) && encodedHash[:len(hash)] == hash {
+					matches = append(matches, contactJID)
+				}
+			}
+		}
+
+		seen := make(map[types.JID]struct{}, len(matches))
+		for _, match := range matches {
+			if _, alreadySeen := seen[match]; alreadySeen {
+				continue
+			}
+			seen[match] = struct{}{}
+			matchedEvt := evt
+			matchedEvt.JID = match
+			cli.dispatchEvent(&matchedEvt)
+		}
 	}
+}
+
+func (cli *Client) handleContactsNotification(ctx context.Context, node *waBinary.Node) {
+	children := node.GetChildren()
+	pictureChildren := make([]waBinary.Node, 0, len(children))
+	for _, child := range children {
+		if child.Tag != "update" {
+			continue
+		}
+		child.Tag = "set"
+		pictureChildren = append(pictureChildren, child)
+	}
+	if len(pictureChildren) == 0 {
+		return
+	}
+	pictureNode := *node
+	pictureNode.Content = pictureChildren
+	cli.handlePictureNotification(ctx, &pictureNode)
 }
 
 func (cli *Client) handleDeviceNotification(ctx context.Context, node *waBinary.Node) {
@@ -505,10 +567,36 @@ func (cli *Client) handleNotification(ctx context.Context, node *waBinary.Node) 
 			if err != nil {
 				cli.Log.Warnf("Failed to store redacted phones from group notification: %v", err)
 			}
+			if cli.Store.Groups != nil {
+				switch groupEvt := evt.(type) {
+				case *events.JoinedGroup:
+					err = cli.Store.Groups.PutGroupInfoSnapshot(ctx, &groupEvt.GroupInfo, time.Now())
+					if err == nil {
+						cli.clearGroupPermissionDirty(groupEvt.JID)
+					} else {
+						cli.markGroupPermissionDirty(groupEvt.JID)
+					}
+				case *events.GroupInfo:
+					affectsPermission := groupInfoEventAffectsSendPermission(groupEvt)
+					wasDirty := false
+					if affectsPermission {
+						wasDirty = cli.beginGroupPermissionUpdate(groupEvt.JID)
+					}
+					err = cli.Store.Groups.PutGroupInfoEvent(ctx, groupInfoEventToStore(groupEvt))
+					if affectsPermission {
+						cli.finishGroupPermissionUpdate(groupEvt.JID, wasDirty, err == nil)
+					}
+				}
+				if err != nil {
+					cli.Log.Warnf("Failed to store group notification data: %v", err)
+				}
+			}
 			cancelled = cli.dispatchEvent(evt)
 		}
 	case "picture":
 		cli.handlePictureNotification(ctx, node)
+	case "contacts":
+		cli.handleContactsNotification(ctx, node)
 	case "mediaretry":
 		cli.handleMediaRetryNotification(ctx, node)
 	case "privacy_token":

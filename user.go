@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
 	"google.golang.org/protobuf/proto"
 
@@ -226,6 +227,284 @@ func (cli *Client) IsOnWhatsApp(ctx context.Context, phones []string) ([]types.I
 		}
 	}
 	return output, nil
+}
+
+// GetLIDForJID resolves a phone-number JID to an LID. It first checks the local LID mapping store, and if no mapping
+// is found, it queries WhatsApp using GetUserInfo. Successful network lookups are cached by GetUserInfo.
+//
+// If the input is already an LID, it is returned directly. The input must be a user JID (@s.whatsapp.net or @c.us)
+// or an LID (@lid).
+func (cli *Client) GetLIDForJID(ctx context.Context, jid types.JID) (types.JID, error) {
+	if cli == nil {
+		return types.EmptyJID, ErrClientIsNil
+	}
+	if jid.IsEmpty() || jid.User == "" {
+		return types.EmptyJID, fmt.Errorf("invalid JID %s", jid)
+	}
+	if jid.Server == types.HiddenUserServer {
+		return normalizeResolvedLIDForSource(jid, jid)
+	}
+	if cli.Store == nil || cli.Store.LIDs == nil {
+		return types.EmptyJID, errors.New("LID store is nil")
+	}
+
+	pn, err := normalizePNJIDForLIDLookup(jid)
+	if err != nil {
+		return types.EmptyJID, err
+	}
+
+	lid, err := cli.Store.LIDs.GetLIDForPN(ctx, pn)
+	if err != nil {
+		return types.EmptyJID, fmt.Errorf("failed to get local LID mapping for %s: %w", pn, err)
+	} else if !lid.IsEmpty() {
+		return normalizeResolvedLIDForSource(lid, jid)
+	}
+
+	userInfo, err := cli.GetUserInfo(ctx, []types.JID{pn})
+	if err != nil {
+		return types.EmptyJID, fmt.Errorf("failed to query LID for %s: %w", pn, err)
+	}
+	lid = findLIDInUserInfo(pn, userInfo)
+	if lid.IsEmpty() {
+		return types.EmptyJID, fmt.Errorf("no LID returned for %s", pn)
+	}
+	return normalizeResolvedLIDForSource(lid, jid)
+}
+
+func normalizePNJIDForLIDLookup(jid types.JID) (types.JID, error) {
+	jid = jid.ToNonAD()
+	switch jid.Server {
+	case types.DefaultUserServer:
+		return jid, nil
+	case types.LegacyUserServer:
+		return types.NewJID(jid.User, types.DefaultUserServer), nil
+	default:
+		return types.EmptyJID, fmt.Errorf("cannot resolve LID for non-user JID %s", jid)
+	}
+}
+
+func normalizeResolvedLIDForSource(lid, source types.JID) (types.JID, error) {
+	lid = lid.ToNonAD()
+	if lid.User == "" || lid.Server != types.HiddenUserServer {
+		return types.EmptyJID, fmt.Errorf("invalid resolved LID %s for %s", lid, source)
+	}
+	lid.Device = source.Device
+	return lid, nil
+}
+
+func findLIDInUserInfo(pn types.JID, userInfo map[types.JID]types.UserInfo) types.JID {
+	if info, ok := userInfo[pn]; ok {
+		return info.LID
+	}
+
+	pn = pn.ToNonAD()
+	for user, info := range userInfo {
+		user = user.ToNonAD()
+		if user == pn || (user.User == pn.User && user.Server == types.LegacyUserServer) {
+			return info.LID
+		}
+	}
+	return types.EmptyJID
+}
+
+// GetLIDByUsername resolves a WhatsApp username to an LID using an interactive USync query.
+// At most one optional username PIN may be provided. An empty PIN is treated as omitted.
+func (cli *Client) GetLIDByUsername(ctx context.Context, username string, pin ...string) (types.JID, error) {
+	if cli == nil {
+		return types.EmptyJID, ErrClientIsNil
+	}
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return types.EmptyJID, errors.New("username is empty")
+	}
+	if len(pin) > 1 {
+		return types.EmptyJID, errors.New("only one PIN may be provided to GetLIDByUsername")
+	}
+	var usernamePIN string
+	if len(pin) == 1 {
+		usernamePIN = pin[0]
+	}
+
+	resp, err := cli.sendIQ(ctx, infoQuery{
+		Namespace: "usync",
+		Type:      iqGet,
+		To:        types.ServerJID,
+		Timeout:   32 * time.Second,
+		Content: []waBinary.Node{
+			buildUsernameLIDUSyncNode(cli.generateRequestID(), username, usernamePIN),
+		},
+	})
+	if err != nil {
+		return types.EmptyJID, fmt.Errorf("failed to query LID for username %q: %w", username, err)
+	}
+	return parseUsernameLIDUSyncResponse(resp, username)
+}
+
+func buildUsernameLIDUSyncNode(requestID, username, pin string) waBinary.Node {
+	contactAttrs := waBinary.Attrs{"username": username}
+	if pin != "" {
+		contactAttrs["pin"] = pin
+	}
+
+	return waBinary.Node{
+		Tag: "usync",
+		Attrs: waBinary.Attrs{
+			"sid":     requestID,
+			"mode":    "query",
+			"last":    "true",
+			"index":   "0",
+			"context": "interactive",
+		},
+		Content: []waBinary.Node{
+			{
+				Tag: "query",
+				Content: []waBinary.Node{
+					{Tag: "contact", Attrs: waBinary.Attrs{"addressing_mode": string(types.AddressingModeLID)}},
+					{Tag: "lid"},
+					{Tag: "username"},
+				},
+			},
+			{
+				Tag: "list",
+				Content: []waBinary.Node{{
+					Tag: "user",
+					Content: []waBinary.Node{{
+						Tag:   "contact",
+						Attrs: contactAttrs,
+					}},
+				}},
+			},
+		},
+	}
+}
+
+func parseUsernameLIDUSyncResponse(resp *waBinary.Node, username string) (types.JID, error) {
+	if resp == nil {
+		return types.EmptyJID, &ElementMissingError{Tag: "list", In: "response to username LID usync query"}
+	}
+	list, ok := resp.GetOptionalChildByTag("usync", "list")
+	if !ok {
+		return types.EmptyJID, &ElementMissingError{Tag: "list", In: "response to username LID usync query"}
+	}
+
+	for _, user := range list.GetChildrenByTag("user") {
+		if contact, ok := user.GetOptionalChildByTag("contact"); ok {
+			contactType := contact.AttrGetter().OptionalString("type")
+			if contactType != "" && contactType != "in" {
+				continue
+			}
+		}
+
+		jid := user.AttrGetter().OptionalJIDOrEmpty("jid").ToNonAD()
+		lidNode := user.GetChildByTag("lid")
+		lid := lidNode.AttrGetter().OptionalJIDOrEmpty("val").ToNonAD()
+		jidIsLID := jid.Server == types.HiddenUserServer
+		lidIsLID := lid.Server == types.HiddenUserServer
+		if jidIsLID && lidIsLID && jid != lid {
+			return types.EmptyJID, fmt.Errorf("username %q returned mismatched LIDs %s and %s", username, jid, lid)
+		}
+		if jidIsLID {
+			return jid, nil
+		}
+		if lidIsLID {
+			return lid, nil
+		}
+	}
+
+	return types.EmptyJID, fmt.Errorf("username %q was not resolved to a LID", username)
+}
+
+// GetUsernameByLID resolves a WhatsApp LID to its username using an interactive USync query.
+func (cli *Client) GetUsernameByLID(ctx context.Context, lid types.JID) (string, error) {
+	if cli == nil {
+		return "", ErrClientIsNil
+	}
+	lid = lid.ToNonAD()
+	if lid.IsEmpty() || lid.User == "" || lid.Server != types.HiddenUserServer {
+		return "", fmt.Errorf("invalid LID %s", lid)
+	}
+
+	resp, err := cli.sendIQ(ctx, infoQuery{
+		Namespace: "usync",
+		Type:      iqGet,
+		To:        types.ServerJID,
+		Timeout:   32 * time.Second,
+		Content: []waBinary.Node{
+			buildLIDUsernameUSyncNode(cli.generateRequestID(), lid),
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to query username for LID %s: %w", lid, err)
+	}
+	return parseLIDUsernameUSyncResponse(resp, lid)
+}
+
+func buildLIDUsernameUSyncNode(requestID string, lid types.JID) waBinary.Node {
+	return waBinary.Node{
+		Tag: "usync",
+		Attrs: waBinary.Attrs{
+			"sid":     requestID,
+			"mode":    "query",
+			"last":    "true",
+			"index":   "0",
+			"context": "interactive",
+		},
+		Content: []waBinary.Node{
+			{
+				Tag: "query",
+				Content: []waBinary.Node{
+					{Tag: "contact"},
+					{Tag: "username"},
+				},
+			},
+			{
+				Tag: "list",
+				Content: []waBinary.Node{{
+					Tag:   "user",
+					Attrs: waBinary.Attrs{"jid": lid},
+				}},
+			},
+		},
+	}
+}
+
+func parseLIDUsernameUSyncResponse(resp *waBinary.Node, lid types.JID) (string, error) {
+	if resp == nil {
+		return "", &ElementMissingError{Tag: "list", In: "response to LID username usync query"}
+	}
+	list, ok := resp.GetOptionalChildByTag("usync", "list")
+	if !ok {
+		return "", &ElementMissingError{Tag: "list", In: "response to LID username usync query"}
+	}
+
+	for _, user := range list.GetChildrenByTag("user") {
+		responseJID, ok := user.Attrs["jid"].(types.JID)
+		if !ok || responseJID.ToNonAD() != lid {
+			continue
+		}
+
+		if usernameNode, ok := user.GetOptionalChildByTag("username"); ok {
+			var username string
+			switch content := usernameNode.Content.(type) {
+			case []byte:
+				username = string(content)
+			case string:
+				username = content
+			}
+			if username = strings.TrimSpace(username); username != "" {
+				return username, nil
+			}
+		}
+
+		if contact, ok := user.GetOptionalChildByTag("contact"); ok {
+			username := strings.TrimSpace(contact.AttrGetter().OptionalString("username"))
+			if username != "" {
+				return username, nil
+			}
+		}
+	}
+
+	return "", fmt.Errorf("LID %s was not resolved to a username", lid)
 }
 
 // GetUserInfo gets basic user info (avatar, status, verified business name, device list).
@@ -1023,48 +1302,53 @@ func (cli *Client) GetBlocklist(ctx context.Context, dhash string) (*types.Block
 }
 
 // UpdateBlocklist updates the user's block list and returns the updated list.
-//
-// If a dhash is provided, and it matches the server value, then an updated blocklist will not be returned.
-func (cli *Client) UpdateBlocklist(ctx context.Context, jid types.JID, action events.BlocklistChangeAction, dhash string) (*types.Blocklist, error) {
-	var lidJID, pnJID types.JID
+func (cli *Client) UpdateBlocklist(ctx context.Context, lidJID types.JID, action events.BlocklistChangeAction) (*types.Blocklist, error) {
 
-	if jid.Server == types.DefaultUserServer {
-		pnJID = jid
-		lid, err := cli.Store.LIDs.GetLIDForPN(ctx, jid)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get LID for PN %s: %w", jid, err)
-		}
-		if lid.IsEmpty() {
-			info, err := cli.GetUserInfo(ctx, []types.JID{jid})
-			if err != nil {
-				return nil, fmt.Errorf("failed to get user info for %s to fill LID cache: %w", jid, err)
-			}
-			lid = info[jid].LID
-			if lid.IsEmpty() {
-				return nil, fmt.Errorf("%w: no LID found for %s from server", ErrRecipientNotOnWhatsApp, jid)
-			}
-		}
-		lidJID = lid
-	} else if jid.Server == types.HiddenUserServer {
-		lidJID = jid
-		if action == events.BlocklistChangeActionBlock {
-			pn, err := cli.Store.LIDs.GetPNForLID(ctx, jid)
-			if err != nil {
-				return nil, fmt.Errorf("failed to resolve PN for %s: %w", jid, err)
-			}
-			pnJID = pn
-		}
+	lidJID = lidJID.ToNonAD()
+	if lidJID.User == "" || lidJID.Server != types.HiddenUserServer {
+		return nil, fmt.Errorf("invalid LID JID: %s", lidJID)
 	}
-
 	itemAttrs := waBinary.Attrs{
 		"jid":    lidJID,
 		"action": string(action),
 	}
-	if action == events.BlocklistChangeActionBlock && !pnJID.IsEmpty() {
+	switch action {
+	case events.BlocklistChangeActionBlock:
+		pnJID, err := cli.Store.LIDs.GetPNForLID(ctx, lidJID)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"failed to resolve PN for LID %s: %w",
+				lidJID,
+				err,
+			)
+		}
+
+		if pnJID.IsEmpty() {
+			return nil, fmt.Errorf(
+				"no PN mapping found for LID %s",
+				lidJID,
+			)
+		}
+
+		pnJID = pnJID.ToNonAD()
+		if pnJID.Server != types.DefaultUserServer {
+			return nil, fmt.Errorf(
+				"invalid PN JID %s resolved for LID %s",
+				pnJID,
+				lidJID,
+			)
+		}
+
+		// 只有拉黑需要 pn_jid。
 		itemAttrs["pn_jid"] = pnJID
-	}
-	if dhash != "" {
-		itemAttrs["dhash"] = dhash
+	case events.BlocklistChangeActionUnblock:
+		// 取消拉黑不能携带 pn_jid。
+
+	default:
+		return nil, fmt.Errorf(
+			"invalid blocklist action %q",
+			action,
+		)
 	}
 
 	resp, err := cli.sendIQ(ctx, infoQuery{
@@ -1083,9 +1367,6 @@ func (cli *Client) UpdateBlocklist(ctx context.Context, jid types.JID, action ev
 	if !ok {
 		return nil, &ElementMissingError{Tag: "list", In: "response to blocklist update"}
 	}
-	if dhash != "" && list.AttrGetter().Bool("matched") {
-		return nil, nil
-	}
 	blocklist, _ := cli.parseBlocklist(&list)
-	return blocklist, err
+	return blocklist, nil
 }

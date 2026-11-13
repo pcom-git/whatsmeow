@@ -185,17 +185,8 @@ func (cli *Client) handleConnectSuccess(ctx context.Context, node *waBinary.Node
 	}
 	cli.deleteExpiredPrivacyTokens()
 	go func() {
-		if dbCount, err := cli.Store.PreKeys.UploadedPreKeyCount(ctx); err != nil {
-			cli.Log.Errorf("Failed to get number of prekeys in database: %v", err)
-		} else if serverCount, err := cli.getServerPreKeyCount(ctx); err != nil {
-			cli.Log.Warnf("Failed to get number of prekeys on server: %v", err)
-		} else {
-			cli.Log.Debugf("Database has %d prekeys, server says we have %d", dbCount, serverCount)
-			if serverCount < MinPreKeyCount || dbCount < MinPreKeyCount {
-				cli.uploadPreKeys(ctx, dbCount == 0 && serverCount == 0)
-				sc, _ := cli.getServerPreKeyCount(ctx)
-				cli.Log.Debugf("Prekey count after upload: %d", sc)
-			}
+		if err := cli.ensureServerPreKeysFor(ctx, false); err != nil {
+			cli.Log.Warnf("Post-connect prekey health check failed: %v", err)
 		}
 		err := cli.SetPassive(ctx, false)
 		if err != nil {

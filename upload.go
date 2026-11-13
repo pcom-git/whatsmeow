@@ -35,10 +35,10 @@ type UploadResponse struct {
 	Handle     string `json:"handle"`
 	ObjectID   string `json:"object_id"`
 
-	MediaKey      []byte `json:"-"`
-	FileEncSHA256 []byte `json:"-"`
-	FileSHA256    []byte `json:"-"`
-	FileLength    uint64 `json:"-"`
+	MediaKey      []byte `json:"media_key"`
+	FileEncSHA256 []byte `json:"file_enc_sha256"`
+	FileSHA256    []byte `json:"file_sha256"`
+	FileLength    uint64 `json:"file_length"`
 
 	StreamingSidecar []byte `json:"-"`
 }
