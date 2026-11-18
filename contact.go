@@ -172,8 +172,8 @@ func isAddContactPhoneDigits(phone string) bool {
 	return true
 }
 
-// matchesAddContactPhone accepts only an exact match or the Brazilian ninth-digit
-// difference in a server-resolved PN. It must not be used to rewrite requests.
+// matchesAddContactPhone accepts exact matches and known country-specific aliases
+// in a server-resolved PN. It must not be used to rewrite requests.
 func matchesAddContactPhone(phone, resolved string) bool {
 	if !isAddContactPhoneDigits(phone) || !isAddContactPhoneDigits(resolved) {
 		return false
@@ -185,9 +185,26 @@ func matchesAddContactPhone(phone, resolved string) bool {
 	if len(long) < len(short) {
 		long, short = short, long
 	}
-	return len(long) == 13 && len(short) == 12 &&
-		strings.HasPrefix(long, "55") &&
-		long[4] == '9' && long[:4] == short[:4] && long[5:] == short[4:]
+	if len(long) == 13 && len(short) == 12 {
+		// Brazil: the ninth mobile digit follows the country and area codes.
+		if strings.HasPrefix(long, "55") && long[4] == '9' &&
+			long[:4] == short[:4] && long[5:] == short[4:] {
+			return true
+		}
+		// Philippines: domestic trunk 0; Argentina: mobile 9; Mexico: legacy 1.
+		if strings.HasPrefix(long, "6309") ||
+			strings.HasPrefix(long, "549") ||
+			strings.HasPrefix(long, "521") {
+			return long[:2] == short[:2] && long[3:] == short[2:]
+		}
+	}
+	// Cote d'Ivoire: verified 05/07 prefixes added to the old eight-digit number.
+	if len(long) == 13 && len(short) == 11 &&
+		strings.HasPrefix(long, "225") &&
+		(long[3:5] == "05" || long[3:5] == "07") {
+		return short[:3] == "225" && long[5:] == short[3:]
+	}
+	return false
 }
 
 func addContactPhoneQueryValue(phone string) string {
@@ -471,7 +488,7 @@ func parsePhoneContactDeltaResponse(list, result *waBinary.Node, phone string, e
 	if identity.LIDJID != expected.LIDJID {
 		return fmt.Errorf("phone delta LID mismatch for %s: expected %s, got %s", phone, expected.LIDJID, identity.LIDJID)
 	}
-	// Compare the actual PN, not just its Brazilian alias. If query resolved an
+	// Compare the actual PN, not just its accepted alias. If query resolved an
 	// alias, a missing delta PN falls back to the input and must fail this check.
 	if identity.PhoneJID != expected.PhoneJID {
 		return fmt.Errorf("phone delta PN mismatch for %s: expected %s, got %s", phone, expected.PhoneJID, identity.PhoneJID)
