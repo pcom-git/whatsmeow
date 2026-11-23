@@ -811,24 +811,32 @@ func (s *SQLStore) PutAppStateMutationMACs(ctx context.Context, name string, ver
 	})
 }
 
-func (s *SQLStore) DeleteAppStateMutationMACs(ctx context.Context, name string, indexMACs [][]byte) (err error) {
+func (s *SQLStore) DeleteAppStateMutationMACs(ctx context.Context, name string, indexMACs [][]byte) error {
 	if len(indexMACs) == 0 {
-		return
+		return nil
 	}
 	if s.db.Dialect == dbutil.Postgres && PostgresArrayWrapper != nil {
-		_, err = s.db.Exec(ctx, deleteAppStateMutationMACsQueryPostgres, s.JID, name, PostgresArrayWrapper(indexMACs))
-	} else {
-		args := make([]any, 2+len(indexMACs))
-		args[0] = s.JID
-		args[1] = name
-		queryParts := make([]string, len(indexMACs))
-		for i, item := range indexMACs {
-			args[2+i] = item
-			queryParts[i] = fmt.Sprintf("$%d", i+3)
-		}
-		_, err = s.db.Exec(ctx, deleteAppStateMutationMACsQueryGeneric+"("+strings.Join(queryParts, ",")+")", args...)
+		_, err := s.db.Exec(ctx, deleteAppStateMutationMACsQueryPostgres, s.JID, name, PostgresArrayWrapper(indexMACs))
+		return err
 	}
-	return
+	// Each batch binds the JID and collection name in addition to the MACs.
+	return s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
+		for batch := range slices.Chunk(indexMACs, mutationBatchSize) {
+			args := make([]any, 2+len(batch))
+			args[0] = s.JID
+			args[1] = name
+			queryParts := make([]string, len(batch))
+			for i, indexMAC := range batch {
+				args[2+i] = indexMAC
+				queryParts[i] = fmt.Sprintf("$%d", i+3)
+			}
+			query := deleteAppStateMutationMACsQueryGeneric + "(" + strings.Join(queryParts, ",") + ")"
+			if _, err := s.db.Exec(ctx, query, args...); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 func (s *SQLStore) GetAppStateMutationMAC(ctx context.Context, name string, indexMAC []byte) (valueMAC []byte, err error) {
